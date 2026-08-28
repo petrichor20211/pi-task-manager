@@ -4,6 +4,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { canonicalPath, projectKey, readProject, updateProject } from "./store.ts";
+import { registerHandoff } from "./handoff.ts";
 import { organizeProject } from "./organizer.ts";
 import { openTaskTree, type TreeAction } from "./task-tree.ts";
 import type { OrganizeProgress, ProjectIndex, SessionRecord } from "./types.ts";
@@ -118,7 +119,7 @@ async function applyTreeAction(
 		const title = value && compactTitle(value);
 		if (title) await updateProject(ctx.cwd, (latest) => {
 			const target = latest.tasks.find((item) => item.id === task.id);
-			if (target) Object.assign(target, { title, locked: true, updatedAt: new Date().toISOString() });
+			if (target) Object.assign(target, { title, objective: title, locked: true, updatedAt: new Date().toISOString() });
 		});
 	}
 	if (action.type === "rename-session" && session) {
@@ -162,6 +163,7 @@ async function applyTreeAction(
 
 export default function taskManager(pi: ExtensionAPI) {
 	const controller = new AbortController();
+	registerHandoff(pi);
 
 	function scheduleOrganize(ctx: ExtensionContext, force: boolean): boolean {
 		const holder = globalThis as JobHolder;
@@ -342,7 +344,7 @@ export default function taskManager(pi: ExtensionAPI) {
 				const session = currentSession(project, path);
 				const task = session && project.tasks.find((item) => item.id === session.taskId);
 				if (!task) return;
-				Object.assign(task, { title, locked: true, updatedAt: new Date().toISOString() });
+				Object.assign(task, { title, objective: title, locked: true, updatedAt: new Date().toISOString() });
 				renamed = true;
 			});
 			if (!renamed) {

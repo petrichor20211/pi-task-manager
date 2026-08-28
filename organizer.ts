@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { basename } from "node:path";
+import { isGeneratedHandoffMessage } from "./handoff.ts";
 import { canonicalPath, readProject, updateProject } from "./store.ts";
 import type {
 	FileFingerprint,
@@ -50,6 +51,7 @@ interface ParsedSession {
 	createdAt: string;
 	parentSession?: string;
 	name?: string;
+	continuationTaskId?: string;
 	entries: SessionEntry[];
 	branch: SessionEntry[];
 }
@@ -67,12 +69,14 @@ function compactText(value: string, maximum: number): string {
 function userText(entry: SessionEntry): string | undefined {
 	if (entry.type !== "message" || entry.message.role !== "user") return undefined;
 	const content = entry.message.content;
-	if (typeof content === "string") return compactText(content, 1200);
-	const text = content
-		.filter((part): part is Extract<(typeof content)[number], { type: "text" }> => part.type === "text")
-		.map((part) => part.text)
-		.join(" ");
-	return text.trim() ? compactText(text, 1200) : undefined;
+	const text = typeof content === "string"
+		? content
+		: content
+			.filter((part): part is Extract<(typeof content)[number], { type: "text" }> => part.type === "text")
+			.map((part) => part.text)
+			.join(" ");
+	if (!text.trim() || isGeneratedHandoffMessage(text)) return undefined;
+	return compactText(text, 1200);
 }
 
 function collectPath(value: unknown, paths: Map<string, number>): void {
@@ -190,12 +194,21 @@ async function parseSession(path: string, signal?: AbortSignal): Promise<ParsedS
 	}
 	branch.reverse();
 	const named = [...entries].reverse().find((candidate) => candidate.type === "session_info");
+	const continuation = [...branch].reverse().find((candidate) =>
+		candidate.type === "custom_message"
+		&& candidate.customType === "pi-task-manager-continuation"
+		&& candidate.details
+		&& typeof candidate.details === "object");
+	const continuationDetails = continuation?.type === "custom_message"
+		? continuation.details as { task?: { id?: unknown } }
+		: undefined;
 	return {
 		id: header.id,
 		cwd: typeof header.cwd === "string" ? header.cwd : "",
 		createdAt: typeof header.timestamp === "string" ? header.timestamp : "",
 		parentSession: typeof header.parentSession === "string" ? header.parentSession : undefined,
 		name: named?.type === "session_info" ? named.name?.trim() || undefined : undefined,
+		continuationTaskId: typeof continuationDetails?.task?.id === "string" ? continuationDetails.task.id : undefined,
 		entries,
 		branch,
 	};
@@ -297,13 +310,14 @@ async function scanProject(
 			path,
 			cwd: canonicalPath(ctx.cwd),
 			title: existing?.title,
-			taskId: existing?.taskId,
+			taskId: existing?.taskId ?? parsed.continuationTaskId,
 			parentPath: card.parentSession ? canonicalPath(card.parentSession) : undefined,
 			parentId: existing?.parentId,
 			rootSessionId: existing?.rootSessionId,
-			kind: existing?.kind ?? "session",
+			kind: existing?.kind ?? (parsed.continuationTaskId ? "continuation" : "session"),
 			forkPoint: existing?.forkPoint,
 			confidence: existing?.confidence,
+			lastHandoffLeafId: existing?.lastHandoffLeafId,
 			locked: existing?.locked ?? false,
 			createdAt: card.createdAt,
 			updatedAt: card.updatedAt,
@@ -345,6 +359,11 @@ async function scanProject(
 		if (!changedIds.has(record.id)) continue;
 		const child = parsedByPath.get(record.path);
 		const parsedParent = parsedByPath.get(parent.path);
+		if (child?.continuationTaskId) {
+			record.kind = "continuation";
+			record.taskId = child.continuationTaskId;
+			continue;
+		}
 		if (!child || !parsedParent) {
 			record.kind = "fork";
 			continue;
@@ -395,7 +414,7 @@ function buildPrompt(
 		"Return JSON only. Do not invent nested subtasks.",
 		"For every kind=session item, return a concise sessionTitle, a task assignment, a concise taskTitle, and confidence 0..1.",
 		"Use an existing task id when it fits. For a new grouping, use the same taskId value new:<short-key> for all matching sessions.",
-		"For every fork/clone item, return only a concise branchTitle; its task is inherited from its parent.",
+		"For every fork/clone/continuation item, return only a concise branchTitle; its task is inherited from its parent.",
 		"Titles should describe the actual work, not generic phrases such as 'Coding session'. Preserve the language used in the card when practical.",
 		'Exact schema: {"sessions":[{"id":"...","sessionTitle":"...","taskId":"existing-id or new:key","taskTitle":"...","confidence":0.8}],"branches":[{"id":"...","branchTitle":"..."}]}',
 		`Existing tasks: ${JSON.stringify(tasks.map(({ id, title }) => ({ id, title })))}`,
@@ -540,7 +559,10 @@ export async function organizeProject(
 		const root = findRoot(branch, byId);
 		branch.rootSessionId = root.id;
 		branch.taskId = root.taskId ?? ensureUnclassified(project.tasks).id;
-		if (!branch.title) branch.title = branch.card.originalName ?? `${branch.kind === "clone" ? "Clone" : "Fork"} ${branch.id.slice(-6)}`;
+		if (!branch.title) {
+			const kind = branch.kind === "continuation" ? "Continuation" : branch.kind === "clone" ? "Clone" : "Fork";
+			branch.title = branch.card.originalName ?? `${kind} ${branch.id.slice(-6)}`;
+		}
 	}
 
 	const usedTasks = new Set(project.sessions.map((session) => session.taskId).filter(Boolean));

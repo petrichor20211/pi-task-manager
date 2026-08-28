@@ -1,4 +1,4 @@
-export type SessionKind = "session" | "fork" | "clone";
+export type SessionKind = "session" | "fork" | "clone" | "continuation";
 
 export interface SessionCard {
 	originalName?: string;
@@ -26,6 +26,7 @@ export interface SessionRecord {
 	kind: SessionKind;
 	forkPoint?: string;
 	confidence?: number;
+	lastHandoffLeafId?: string;
 	locked: boolean;
 	createdAt: string;
 	updatedAt: string;
@@ -35,6 +36,7 @@ export interface SessionRecord {
 export interface TaskRecord {
 	id: string;
 	title: string;
+	objective?: string;
 	locked: boolean;
 	createdAt: string;
 	updatedAt: string;
@@ -48,6 +50,7 @@ export interface FileFingerprint {
 export interface ProjectIndex {
 	cwd: string;
 	autoOrganize: boolean;
+	autoHandoff: boolean;
 	lastOrganizedAt?: string;
 	tasks: TaskRecord[];
 	sessions: SessionRecord[];

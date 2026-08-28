@@ -103,7 +103,7 @@ export async function openTaskTree(
 					for (const branch of branches) {
 						if (needle && !taskMatches && !matchingSessions.has(branch.id)) continue;
 						const active = currentPath && canonicalPath(branch.path) === canonicalPath(currentPath) ? "●" : " ";
-						const kind = branch.kind === "clone" ? "clone" : "fork";
+						const kind = branch.kind;
 						output.push({
 							type: "session",
 							session: branch,

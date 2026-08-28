@@ -21,6 +21,7 @@ export function emptyProject(cwd: string): ProjectIndex {
 	return {
 		cwd: canonicalPath(cwd),
 		autoOrganize: false,
+		autoHandoff: false,
 		tasks: [],
 		sessions: [],
 		fingerprints: {},
@@ -51,7 +52,8 @@ async function writeIndex(index: TaskManagerIndex): Promise<void> {
 
 export async function readProject(cwd: string): Promise<ProjectIndex> {
 	const index = await readIndex();
-	return index.projects[projectKey(cwd)] ?? emptyProject(cwd);
+	const project = index.projects[projectKey(cwd)];
+	return project ? { ...project, autoHandoff: project.autoHandoff ?? false } : emptyProject(cwd);
 }
 
 export function updateIndex(change: (index: TaskManagerIndex) => void | Promise<void>): Promise<void> {
@@ -69,6 +71,7 @@ export function updateProject(cwd: string, change: (project: ProjectIndex) => vo
 	return updateIndex(async (index) => {
 		const key = projectKey(cwd);
 		const project = index.projects[key] ?? emptyProject(cwd);
+		project.autoHandoff ??= false;
 		await change(project);
 		index.projects[key] = project;
 	});

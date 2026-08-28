@@ -5,10 +5,10 @@ A Pi extension that organizes the current project's existing sessions into a fas
 ```text
 Task
 └─ Session
-   └─ Fork / Clone
+   └─ Fork / Clone / Continuation
 ```
 
-Original session JSONL files are never renamed, moved, modified, or deleted. Pi's built-in `/resume` behavior is unchanged.
+Session JSONL files are never renamed, moved, deleted, or rewritten. Task handoff may append its marked checkpoint request and response to the current Session. Pi's built-in `/resume` behavior is unchanged.
 
 ## Commands
 
@@ -19,6 +19,9 @@ Original session JSONL files are never renamed, moved, modified, or deleted. Pi'
 /task-organize status  Show the current phase, count, and elapsed time
 /task-auto on|off      Persist automatic startup organization for the current project
 /task-title <title>    Rename and lock the current Task
+/task-handoff [focus]  Checkpoint and continue the current Task in a new Session
+/task-handoff-auto on|off
+                       Persist automatic handoff for the current project
 ```
 
 `/tasks` controls:
@@ -30,7 +33,15 @@ Original session JSONL files are never renamed, moved, modified, or deleted. Pi'
 - `Alt+G` merges the selected Task into another Task.
 - `Alt+L` toggles the selected item's manual lock.
 
-Manual names and assignments are marked as locked so later automatic organization does not overwrite them. Forks and clones deterministically inherit the root Session's Task.
+Manual names and assignments are marked as locked so later automatic organization does not overwrite them. Forks, clones, and continuations deterministically inherit the root Session's Task.
+
+## Long-running Task continuation
+
+`/task-handoff` asks the active agent, inside the current Session, to produce a structured Continuation Checkpoint and then creates a new Session under the same Task. The request uses the normal agent path so the current provider prompt cache remains reusable. It appends only the checkpoint request and response to the source Session; existing entries are never rewritten or removed.
+
+The checkpoint separates verified completed facts, explicitly requested unfinished work, questions waiting for the user, and non-binding assistant notes. Automatic continuation executes only unfinished work traceable to a real user request. Generated checkpoint and continuation prompts are ignored when later Session Cards determine user intent.
+
+Automatic handoff is off by default and stored per normalized project path. When enabled, it checks after a settled agent run at 35% context usage, leaving room for the checkpoint response before switching. A continuation with executable unfinished work starts automatically; one that requires user input asks only the recorded question and waits without inventing work.
 
 ## Organization and cost
 
