@@ -1,9 +1,12 @@
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
+	Container,
 	Input,
 	Key,
 	matchesKey,
+	Spacer,
 	truncateToWidth,
+	visibleWidth,
 	type Component,
 	type Focusable,
 } from "@earendil-works/pi-tui";
@@ -30,6 +33,20 @@ function updatedTime(task: TaskRecord, sessions: SessionRecord[]): number {
 	);
 }
 
+function activityAge(timestamp: number): string {
+	const elapsed = Math.max(0, Date.now() - timestamp);
+	const minutes = Math.floor(elapsed / 60_000);
+	const hours = Math.floor(elapsed / 3_600_000);
+	const days = Math.floor(elapsed / 86_400_000);
+	if (minutes < 1) return "now";
+	if (minutes < 60) return `${minutes}m`;
+	if (hours < 24) return `${hours}h`;
+	if (days < 7) return `${days}d`;
+	if (days < 30) return `${Math.floor(days / 7)}w`;
+	if (days < 365) return `${Math.floor(days / 30)}mo`;
+	return `${Math.floor(days / 365)}y`;
+}
+
 export async function openTaskTree(
 	ctx: ExtensionCommandContext,
 	project: ProjectIndex,
@@ -39,7 +56,10 @@ export async function openTaskTree(
 	return ctx.ui.custom<TreeAction | null>((tui, theme, _keybindings, done) => {
 		const search = new Input();
 		search.focused = true;
-		const expandedTasks = new Set(project.tasks.map((task) => task.id));
+		const newestTask = [...project.tasks].sort(
+			(left, right) => updatedTime(right, project.sessions) - updatedTime(left, project.sessions),
+		)[0];
+		const expandedTasks = new Set(newestTask ? [newestTask.id] : []);
 		const expandedRoots = new Set(project.sessions.filter((session) => !session.parentId).map((session) => session.id));
 		let selected = 0;
 		let query = "";
@@ -81,11 +101,10 @@ export async function openTaskTree(
 						.map((session) => session.id),
 				);
 				if (needle && !taskMatches && matchingSessions.size === 0) continue;
-				const taskMarker = needle || expandedTasks.has(task.id) ? "▾" : "▸";
 				output.push({
 					type: "task",
 					task,
-					label: `${taskMarker} ${task.locked ? "🔒 " : ""}${task.title} (${taskSessions.length})`,
+					label: `${task.locked ? "🔒 " : ""}${task.title} (${taskSessions.length})`,
 				});
 				if (!needle && !expandedTasks.has(task.id)) continue;
 				for (const root of roots) {
@@ -180,6 +199,53 @@ export async function openTaskTree(
 			}
 		}
 
+		const content: Component = {
+			render(width: number): string[] {
+				const safeWidth = Math.max(1, width);
+				const visible = rows();
+				const title = theme.bold("Tasks");
+				const sort = `${theme.fg("muted", "Sort: ")}${theme.fg("accent", "Recent")}`;
+				const titleWidth = Math.max(0, safeWidth - visibleWidth(sort) - 1);
+				const left = truncateToWidth(title, titleWidth, "");
+				const lines = [`${left}${" ".repeat(Math.max(0, safeWidth - visibleWidth(left) - visibleWidth(sort)))}${sort}`];
+				lines.push(theme.fg("muted", "Newest Task first · type to search"));
+				lines.push("");
+				lines.push(...search.render(safeWidth));
+				lines.push("");
+				if (visible.length === 0) lines.push(theme.fg("warning", "  No matching tasks"));
+				const maxVisible = 18;
+				const start = Math.max(0, Math.min(selected - Math.floor(maxVisible / 2), visible.length - maxVisible));
+				for (let index = start; index < Math.min(visible.length, start + maxVisible); index++) {
+					const row = visible[index];
+					const cursor = index === selected ? theme.fg("accent", "› ") : "  ";
+					const right = row.type === "task" ? activityAge(updatedTime(row.task, project.sessions)) : "";
+					const availableLabelWidth = Math.max(1, safeWidth - visibleWidth(cursor) - (right ? visibleWidth(right) + 2 : 0));
+					const label = truncateToWidth(row.label, availableLabelWidth, "…");
+					const spacing = right
+						? " ".repeat(Math.max(1, safeWidth - visibleWidth(cursor) - visibleWidth(label) - visibleWidth(right)))
+						: "";
+					let line = `${cursor}${label}${spacing}${right ? theme.fg("dim", right) : ""}`;
+					if (index === selected) line = theme.bg("selectedBg", theme.bold(line));
+					lines.push(truncateToWidth(line, safeWidth, ""));
+				}
+				if (visible.length > maxVisible) lines.push(theme.fg("dim", `  (${selected + 1}/${visible.length})`));
+				lines.push("");
+				lines.push(theme.fg("dim", "↑↓ select · ←→ fold · Enter open · Ctrl+R rename · Alt+M move · Alt+G merge · Alt+L lock · Esc close"));
+				return lines.map((line) => truncateToWidth(line, safeWidth, ""));
+			},
+			invalidate() {
+				search.invalidate();
+			},
+		};
+
+		const panel = new Container();
+		panel.addChild(new Spacer(1));
+		panel.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+		panel.addChild(new Spacer(1));
+		panel.addChild(content);
+		panel.addChild(new Spacer(1));
+		panel.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+
 		const component: Component & Focusable = {
 			get focused() {
 				return search.focused;
@@ -188,22 +254,10 @@ export async function openTaskTree(
 				search.focused = value;
 			},
 			render(width: number): string[] {
-				const visible = rows();
-				const lines = [theme.fg("accent", theme.bold("Tasks"))];
-				lines.push(...search.render(Math.max(1, width)).map((line) => theme.fg("muted", `Search ${line}`)));
-				if (visible.length === 0) lines.push(theme.fg("warning", "  No matching tasks"));
-				const maxVisible = 18;
-				const start = Math.max(0, Math.min(selected - Math.floor(maxVisible / 2), visible.length - maxVisible));
-				for (let index = start; index < Math.min(visible.length, start + maxVisible); index++) {
-					const text = truncateToWidth(visible[index].label, Math.max(1, width), "…");
-					lines.push(index === selected ? theme.bg("selectedBg", theme.fg("text", text)) : text);
-				}
-				if (visible.length > maxVisible) lines.push(theme.fg("dim", `  ${selected + 1}/${visible.length}`));
-				lines.push(theme.fg("dim", "↑↓ select · ←→ fold · Enter open · Ctrl+R rename · Alt+M move · Alt+G merge · Alt+L lock · Esc close"));
-				return lines.map((line) => truncateToWidth(line, Math.max(1, width), ""));
+				return panel.render(width);
 			},
 			invalidate() {
-				search.invalidate();
+				panel.invalidate();
 			},
 			handleInput,
 		};

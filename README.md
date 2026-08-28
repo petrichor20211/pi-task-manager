@@ -24,6 +24,8 @@ Session JSONL files are never renamed, moved, deleted, or rewritten. Task handof
                        Persist automatic handoff for the current project
 ```
 
+`/tasks` opens a bordered selector matching Pi's `/resume` layout. Tasks show their latest activity time on the right and are ordered newest first. The newest Task starts expanded; all other Tasks start folded.
+
 `/tasks` controls:
 
 - Type to search; `↑`/`↓` selects and `←`/`→` folds or unfolds.
