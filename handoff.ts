@@ -10,6 +10,7 @@ import type { ProjectIndex, SessionRecord, TaskRecord } from "./types.ts";
 const CUSTOM_TYPE = "pi-task-manager-continuation";
 const REQUEST_MARKER_PREFIX = "pi-task-manager:checkpoint-request:";
 const AUTO_CONTINUE_MARKER = "pi-task-manager:auto-continue";
+const READY_MARKER = "pi-task-manager:continuation-ready";
 const AUTO_HANDOFF_PERCENT = 35;
 const HANDOFF_TIMEOUT_MS = 15 * 60 * 1000;
 
@@ -87,7 +88,7 @@ function contentText(content: unknown): string {
 }
 
 export function isGeneratedHandoffMessage(text: string): boolean {
-	return text.includes(REQUEST_MARKER_PREFIX) || text.includes(AUTO_CONTINUE_MARKER);
+	return text.includes(REQUEST_MARKER_PREFIX) || text.includes(AUTO_CONTINUE_MARKER) || text.includes(READY_MARKER);
 }
 
 function priorCheckpointAuthority(entry: SessionEntry): string[] {
@@ -311,6 +312,10 @@ function waitingPrompt(checkpoint: ContinuationCheckpoint): string {
 	return `The current Task cannot proceed without user input. Do not execute work, answer the questions yourself, or introduce additional suggestions. Ask the user only for the following required input:\n\n${checkpoint.awaitingUser.map((item) => `- ${item}`).join("\n")}\n\n<!-- ${AUTO_CONTINUE_MARKER} -->`;
 }
 
+function readyPrompt(): string {
+	return `The Continuation Checkpoint has no recorded unfinished work or pending question. Do not execute work or introduce suggestions. Reply briefly that the new session is ready, then wait for the user's next request.\n\n<!-- ${READY_MARKER} -->`;
+}
+
 function currentSession(project: ProjectIndex, path?: string): SessionRecord | undefined {
 	if (!path) return undefined;
 	const canonical = canonicalPath(path);
@@ -335,7 +340,10 @@ function waitForCheckpoint(
 	});
 }
 
-export function registerHandoff(pi: ExtensionAPI): void {
+export function registerHandoff(
+	pi: ExtensionAPI,
+	organizeIfNeeded?: (ctx: ExtensionCommandContext) => Promise<void>,
+): void {
 	let pendingHandoff: PendingHandoff | undefined;
 	let autoHandoffQueued = false;
 
@@ -415,17 +423,26 @@ export function registerHandoff(pi: ExtensionAPI): void {
 				ctx.ui.notify("A Task handoff is already in progress", "warning");
 				return;
 			}
+			const automatic = autoHandoffQueued;
+			autoHandoffQueued = false;
 			if (!ctx.model) {
 				ctx.ui.notify("No model selected", "error");
 				return;
 			}
 			const cwd = ctx.cwd;
 			const sourcePath = ctx.sessionManager.getSessionFile();
-			const project = await readProject(cwd);
-			const sourceSession = currentSession(project, sourcePath);
-			const task = sourceSession && project.tasks.find((item) => item.id === sourceSession.taskId);
+			let project = await readProject(cwd);
+			let sourceSession = currentSession(project, sourcePath);
+			let task = project.tasks.find((item) => item.id === sourceSession?.taskId);
+			if (sourcePath && (!sourceSession || !task) && organizeIfNeeded) {
+				ctx.ui.notify("Current session is not assigned to a Task; organizing before handoff", "info");
+				await organizeIfNeeded(ctx);
+				project = await readProject(cwd);
+				sourceSession = currentSession(project, sourcePath);
+				task = project.tasks.find((item) => item.id === sourceSession?.taskId);
+			}
 			if (!sourcePath || !sourceSession || !task) {
-				ctx.ui.notify("Current session is not assigned to a Task; run /task-organize first", "warning");
+				ctx.ui.notify("Current session could not be assigned to a Task", "warning");
 				return;
 			}
 
@@ -487,7 +504,7 @@ export function registerHandoff(pi: ExtensionAPI): void {
 				},
 			};
 
-			if (checkpoint.explicitUnfinished.length === 0 && checkpoint.awaitingUser.length === 0) {
+			if (automatic && checkpoint.explicitUnfinished.length === 0 && checkpoint.awaitingUser.length === 0) {
 				await updateProject(cwd, (current) => {
 					const source = current.sessions.find((item) => item.id === latestSource.id);
 					const currentTask = current.tasks.find((item) => item.id === latestTask.id);
@@ -499,8 +516,7 @@ export function registerHandoff(pi: ExtensionAPI): void {
 			}
 
 			const title = compactText(`Continuation · ${latestSource.title ?? latestTask.title}`, 90);
-			const root = latest.sessions.find((item) => item.id === (latestSource.rootSessionId ?? latestSource.id)) ?? latestSource;
-			const statusText = [latestTask.title, root.title, title].filter(Boolean).join(" / ");
+			const statusText = latestTask.title;
 			const result = await ctx.newSession({
 				parentSession: latestSource.path,
 				setup: async (sessionManager) => {
@@ -560,9 +576,12 @@ export function registerHandoff(pi: ExtensionAPI): void {
 					if (checkpoint.explicitUnfinished.length > 0) {
 						replacementCtx.ui.notify("Task checkpoint transferred. Continuing explicit unfinished work.", "info");
 						await replacementCtx.sendUserMessage(continuationPrompt(checkpoint));
-					} else {
+					} else if (checkpoint.awaitingUser.length > 0) {
 						replacementCtx.ui.notify("Task checkpoint transferred. Requesting the required user input.", "info");
 						await replacementCtx.sendUserMessage(waitingPrompt(checkpoint));
+					} else {
+						replacementCtx.ui.notify("Task checkpoint transferred to a new session.", "info");
+						await replacementCtx.sendUserMessage(readyPrompt());
 					}
 				},
 			});

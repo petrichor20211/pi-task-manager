@@ -12,8 +12,13 @@ import type { OrganizeProgress, ProjectIndex, SessionRecord } from "./types.ts";
 const jobsKey = Symbol.for("pi-task-manager.organize-jobs");
 interface OrganizeJob {
 	promise: Promise<void>;
+	controller: AbortController;
 	startedAt: number;
 	progress: OrganizeProgress;
+}
+interface OrganizeSchedule {
+	started: boolean;
+	promise: Promise<void>;
 }
 type JobHolder = typeof globalThis & { [jobsKey]?: Map<string, OrganizeJob> };
 
@@ -60,17 +65,10 @@ function descendants(project: ProjectIndex, rootId: string): SessionRecord[] {
 
 function showStatus(ctx: ExtensionContext, project: ProjectIndex): void {
 	const session = currentSession(project, ctx.sessionManager.getSessionFile());
-	if (!session) {
-		ctx.ui.setStatus("task-manager", undefined);
-		return;
-	}
-	const task = project.tasks.find((item) => item.id === session.taskId);
-	const root = project.sessions.find((item) => item.id === session.rootSessionId) ?? session;
-	const parts = [task?.title, root.title];
-	if (session.id !== root.id) parts.push(session.title);
+	const task = session && project.tasks.find((item) => item.id === session.taskId);
 	ctx.ui.setStatus(
 		"task-manager",
-		ctx.ui.theme.fg("accent", parts.filter(Boolean).join(" / ")),
+		task ? ctx.ui.theme.fg("accent", task.title) : undefined,
 	);
 }
 
@@ -162,10 +160,7 @@ async function applyTreeAction(
 }
 
 export default function taskManager(pi: ExtensionAPI) {
-	const controller = new AbortController();
-	registerHandoff(pi);
-
-	function scheduleOrganize(ctx: ExtensionContext, force: boolean): boolean {
+	function scheduleOrganize(ctx: ExtensionContext, force: boolean): OrganizeSchedule {
 		const holder = globalThis as JobHolder;
 		const jobs = holder[jobsKey] ?? new Map<string, OrganizeJob>();
 		holder[jobsKey] = jobs;
@@ -176,11 +171,12 @@ export default function taskManager(pi: ExtensionAPI) {
 				`Task organization is already running: ${progressText(running.progress, Date.now() - running.startedAt)}`,
 				"info",
 			);
-			return false;
+			return { started: false, promise: running.promise };
 		}
 		const startedAt = Date.now();
 		const initialProgress: OrganizeProgress = { phase: "scanning", completed: 0, total: 0, elapsedMs: 0 };
-		const record: OrganizeJob = { promise: Promise.resolve(), startedAt, progress: initialProgress };
+		const jobController = new AbortController();
+		const record: OrganizeJob = { promise: Promise.resolve(), controller: jobController, startedAt, progress: initialProgress };
 		let lastRenderedAt = startedAt;
 		jobs.set(key, record);
 		if (ctx.hasUI) ctx.ui.setStatus(
@@ -196,7 +192,7 @@ export default function taskManager(pi: ExtensionAPI) {
 			} catch {}
 		}, 1000) : undefined;
 		refreshTimer?.unref();
-		const job = organizeProject(ctx, force, controller.signal, (progress) => {
+		const job = organizeProject(ctx, force, jobController.signal, (progress) => {
 			const phaseChanged = progress.phase !== record.progress.phase;
 			record.progress = progress;
 			const now = Date.now();
@@ -218,7 +214,7 @@ export default function taskManager(pi: ExtensionAPI) {
 				showStatus(ctx, await readProject(ctx.cwd));
 			})
 			.catch((error) => {
-				if (!controller.signal.aborted && ctx.hasUI) {
+				if (!jobController.signal.aborted && ctx.hasUI) {
 					ctx.ui.notify(`Task organization failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 				}
 			})
@@ -230,8 +226,12 @@ export default function taskManager(pi: ExtensionAPI) {
 				} catch {}
 			});
 		record.promise = job;
-		return true;
+		return { started: true, promise: job };
 	}
+
+	registerHandoff(pi, async (ctx) => {
+		await scheduleOrganize(ctx, false).promise;
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		const project = await readProject(ctx.cwd);
@@ -240,7 +240,7 @@ export default function taskManager(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
-		controller.abort();
+		for (const job of (globalThis as JobHolder)[jobsKey]?.values() ?? []) job.controller.abort();
 	});
 
 	pi.on("session_info_changed", async (event, ctx) => {
@@ -305,7 +305,7 @@ export default function taskManager(pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /task-organize [--all|status]", "error");
 				return;
 			}
-			if (scheduleOrganize(ctx, option === "--all")) {
+			if (scheduleOrganize(ctx, option === "--all").started) {
 				ctx.ui.notify("Task organization started in the background", "info");
 			}
 		},

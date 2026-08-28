@@ -39,9 +39,9 @@ Manual names and assignments are marked as locked so later automatic organizatio
 
 ## Long-running Task continuation
 
-`/task-handoff` asks the active agent, inside the current Session, to produce a structured Continuation Checkpoint and then creates a new Session under the same Task. The request uses the normal agent path so the current provider prompt cache remains reusable. It appends only the checkpoint request and response to the source Session; existing entries are never rewritten or removed.
+`/task-handoff` asks the active agent, inside the current Session, to produce a structured Continuation Checkpoint and then creates a new Session under the same Task. If the current Session is not assigned to a Task yet, it first runs an incremental organization pass and then continues the handoff automatically. The request uses the normal agent path so the current provider prompt cache remains reusable. It appends only the checkpoint request and response to the source Session; existing entries are never rewritten or removed.
 
-The checkpoint separates verified completed facts, explicitly requested unfinished work, questions waiting for the user, and non-binding assistant notes. Automatic continuation executes only unfinished work traceable to a real user request. Generated checkpoint and continuation prompts are ignored when later Session Cards determine user intent.
+The checkpoint separates verified completed facts, explicitly requested unfinished work, questions waiting for the user, and non-binding assistant notes. A manual handoff always switches to a fresh Session; when no unfinished work or question is recorded, the new Session simply waits for the user's next request. Automatic continuation executes only unfinished work traceable to a real user request. Generated checkpoint and continuation prompts are ignored when later Session Cards determine user intent.
 
 Automatic handoff is off by default and stored per normalized project path. When enabled, it checks after a settled agent run at 35% context usage, leaving room for the checkpoint response before switching. A continuation with executable unfinished work starts automatically; one that requires user input asks only the recorded question and waits without inventing work.
 
