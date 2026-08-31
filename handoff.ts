@@ -246,22 +246,26 @@ function findHandoffOutcome(branch: SessionEntry[], pending: PendingHandoff): Ha
 	if (requestIndex < 0) return undefined;
 
 	let response: Extract<SessionEntry, { type: "message" }> | undefined;
+	let unexpectedlyCalledTool = false;
 	for (let index = requestIndex + 1; index < branch.length; index++) {
 		const entry = branch[index];
 		if (entry.type !== "message") continue;
 		if (entry.message.role === "user" && !isGeneratedHandoffMessage(contentText(entry.message.content))) {
 			return { status: "error", message: "The conversation changed while the checkpoint was being generated; run /task-handoff again" };
 		}
-		if (!response && entry.message.role === "assistant") response = entry;
+		if (entry.message.role === "assistant") {
+			response = entry;
+			unexpectedlyCalledTool ||= entry.message.content.some((part) => part.type === "toolCall");
+		}
 	}
 	if (!response) return undefined;
 	const message = response.message;
 	if (message.role !== "assistant") return undefined;
-	if (message.stopReason === "aborted") return { status: "cancelled" };
-	if (message.stopReason === "error") return { status: "error", message: message.errorMessage ?? "Checkpoint generation failed" };
-	if (message.content.some((part) => part.type === "toolCall")) {
+	if (unexpectedlyCalledTool) {
 		return { status: "error", message: "Checkpoint generation unexpectedly called a tool" };
 	}
+	if (message.stopReason === "aborted") return { status: "cancelled" };
+	if (message.stopReason === "error") return { status: "error", message: message.errorMessage ?? "Checkpoint generation failed" };
 	const text = contentText(message.content).trim();
 	if (!text) return { status: "error", message: "The model returned an empty checkpoint" };
 	try {
