@@ -4,7 +4,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { canonicalPath, projectKey, readProject, updateProject } from "./store.ts";
-import { registerHandoff } from "./handoff.ts";
+import { isHandoffReplacement, registerHandoff } from "./handoff.ts";
 import { organizeProject } from "./organizer.ts";
 import { openTaskTree, type TreeAction } from "./task-tree.ts";
 import type { OrganizeProgress, ProjectIndex, SessionRecord } from "./types.ts";
@@ -61,15 +61,6 @@ function descendants(project: ProjectIndex, rootId: string): SessionRecord[] {
 		}
 	}
 	return result;
-}
-
-function showStatus(ctx: ExtensionContext, project: ProjectIndex): void {
-	const session = currentSession(project, ctx.sessionManager.getSessionFile());
-	const task = session && project.tasks.find((item) => item.id === session.taskId);
-	ctx.ui.setStatus(
-		"task-manager",
-		task ? ctx.ui.theme.fg("accent", task.title) : undefined,
-	);
 }
 
 async function selectTask(
@@ -216,12 +207,11 @@ export default function taskManager(pi: ExtensionAPI) {
 				);
 			} catch {}
 		})
-			.then(async (result) => {
+			.then((result) => {
 				if (ctx.hasUI) ctx.ui.notify(
 					`Task organization finished in ${elapsedText(Date.now() - startedAt)}: ${result.changed} changed, ${result.classified} classified`,
 					"info",
 				);
-				showStatus(ctx, await readProject(ctx.cwd));
 			})
 			.catch((error) => {
 				if (!jobController.signal.aborted && ctx.hasUI) {
@@ -241,9 +231,14 @@ export default function taskManager(pi: ExtensionAPI) {
 
 	registerHandoff(pi);
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
+		// Task titles are available in /tasks; keeping them permanently in the
+		// shared footer adds noise and can consume most of a narrow terminal.
+		ctx.ui.setStatus("task-manager", undefined);
+		// newSession.setup() has not run yet, so scanning here could race the
+		// handoff transaction and observe an incomplete continuation Session.
+		if (isHandoffReplacement(event.previousSessionFile)) return;
 		const project = await readProject(ctx.cwd);
-		showStatus(ctx, project);
 		if (project.autoOrganize) setTimeout(() => scheduleOrganize(ctx, false), 0);
 	});
 
@@ -259,7 +254,6 @@ export default function taskManager(pi: ExtensionAPI) {
 			const session = currentSession(project, path);
 			if (session) Object.assign(session, { title: event.name, locked: true });
 		});
-		showStatus(ctx, await readProject(ctx.cwd));
 	});
 
 	pi.registerCommand("tasks", {
@@ -286,7 +280,6 @@ export default function taskManager(pi: ExtensionAPI) {
 				if (!action) return;
 				if ((await applyTreeAction(action, ctx)) === "switched") return;
 				project = await readProject(ctx.cwd);
-				showStatus(ctx, project);
 			}
 		},
 	});
@@ -360,8 +353,6 @@ export default function taskManager(pi: ExtensionAPI) {
 				ctx.ui.notify("Current session is not indexed; run /task-organize first", "warning");
 				return;
 			}
-			const project = await readProject(ctx.cwd);
-			showStatus(ctx, project);
 			ctx.ui.notify(`Task renamed: ${title}`, "info");
 		},
 	});

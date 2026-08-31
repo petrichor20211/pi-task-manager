@@ -31,7 +31,6 @@ import type { SessionRecord, TaskRecord } from "./types.ts";
 export { isGeneratedHandoffMessage } from "./checkpoint.ts";
 
 const AUTO_HANDOFF_PERCENT = 35;
-const SESSION_ATTEMPTS = 2;
 
 type NewSessionOptions = NonNullable<Parameters<ExtensionCommandContext["newSession"]>[0]>;
 type ReplacementContext = Parameters<NonNullable<NewSessionOptions["withSession"]>>[0];
@@ -42,6 +41,10 @@ type OperationHolder = typeof globalThis & { [operationsKey]?: Set<string> };
 function activeOperations(): Set<string> {
 	const holder = globalThis as OperationHolder;
 	return holder[operationsKey] ??= new Set<string>();
+}
+
+export function isHandoffReplacement(previousSessionFile?: string): boolean {
+	return Boolean(previousSessionFile && activeOperations().has(canonicalPath(previousSessionFile)));
 }
 
 function emptyUsage() {
@@ -143,11 +146,14 @@ async function reusableJournal(sourcePath: string, leafId: string | undefined, f
 export function registerHandoff(pi: ExtensionAPI): void {
 	let autoHandoffQueued = false;
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		autoHandoffQueued = false;
 		await recoverPersistedHandoff(pi, ctx);
 		const path = ctx.sessionManager.getSessionFile();
 		if (!path) return;
+		// Pi emits session_start before newSession.setup(). The source operation
+		// marker is therefore the only safe way to avoid indexing an unprepared target.
+		if (isHandoffReplacement(event.previousSessionFile)) return;
 		const activeTarget = (await listHandoffJournals()).some((journal) =>
 			journal.state === "SWITCHING"
 			&& journal.ownerPid === process.pid
@@ -225,7 +231,8 @@ export function registerHandoff(pi: ExtensionAPI): void {
 
 			let journal: HandoffJournal | undefined;
 			try {
-				if (!ctx.model) throw new Error("No model selected");
+				const selectedModel = ctx.model;
+				if (!selectedModel) throw new Error("No model selected");
 				await ctx.waitForIdle();
 				const focus = compactText(args, 1200);
 				let sourceLeafId = ctx.sessionManager.getLeafId() ?? undefined;
@@ -325,8 +332,22 @@ export function registerHandoff(pi: ExtensionAPI): void {
 
 				const continueText = continuationPrompt(checkpoint) ?? waitingPrompt(checkpoint);
 				const title = compactText(`Continuation · ${identity.session.title ?? checkpoint.task.title}`, 90);
+				const sourceCwd = journal.source.cwd;
+				const sourceAssignment = identity.session.assignmentSource;
+				const sourceRootId = identity.session.rootSessionId ?? identity.session.id;
+				const bootstrapModel = { api: selectedModel.api, provider: selectedModel.provider, id: selectedModel.id };
+				let setupError: unknown;
 				const finishReplacement = async (replacementCtx: ReplacementContext): Promise<void> => {
-					replacementCtx.ui.setStatus("task-manager", replacementCtx.ui.theme.fg("accent", checkpoint.task.title));
+					if (setupError) {
+						journal!.state = "FAILED";
+						journal!.error = setupError instanceof Error ? setupError.message : String(setupError);
+						await writeHandoffJournal(journal!).catch(() => undefined);
+						const message = `Handoff target setup failed: ${journal!.error}`;
+						await replacementCtx.switchSession(canonicalSource, {
+							withSession: async (sourceCtx) => sourceCtx.ui.notify(message, "error"),
+						});
+						return;
+					}
 					let continuationError: unknown;
 					if (continueText) {
 						try {
@@ -367,103 +388,93 @@ export function registerHandoff(pi: ExtensionAPI): void {
 					);
 				};
 
-				let cancelled = false;
-				let switched = false;
-				let lastError: unknown;
-				for (let attempt = 0; attempt < SESSION_ATTEMPTS; attempt++) {
-					try {
-						if (journal.target && await targetExists(journal)) {
-							await verifyTargetSession(journal.target.sessionPath, journal.target.sessionId, journal.handoffId);
-							const result = await ctx.switchSession(journal.target.sessionPath, { withSession: finishReplacement });
-							cancelled = result.cancelled;
-						} else {
-							const result = await ctx.newSession({
-								parentSession: canonicalSource,
-								setup: async (sessionManager) => {
-									const path = sessionManager.getSessionFile();
-									const header = sessionManager.getHeader();
-									if (!path || !header) throw new Error("The continuation Session has no durable identity");
-									const createdAt = header.timestamp;
-									const targetPath = canonicalPath(path);
-									const record: SessionRecord = {
-										id: sessionManager.getSessionId(),
-										path: targetPath,
-										cwd: canonicalPath(ctx.cwd),
-										title,
-										taskId: checkpoint.task.taskId,
-										assignmentSource: identity.session.assignmentSource,
-										parentPath: canonicalSource,
-										parentId: identity.session.id,
-										rootSessionId: identity.session.rootSessionId ?? identity.session.id,
-										kind: "continuation",
-										confidence: 1,
-										locked: false,
+				let cancelled: boolean;
+				if (journal.target && await targetExists(journal)) {
+					await verifyTargetSession(journal.target.sessionPath, journal.target.sessionId, journal.handoffId);
+					cancelled = (await ctx.switchSession(journal.target.sessionPath, { withSession: finishReplacement })).cancelled;
+				} else {
+					cancelled = (await ctx.newSession({
+						parentSession: canonicalSource,
+						setup: async (sessionManager) => {
+							try {
+								const path = sessionManager.getSessionFile();
+								const header = sessionManager.getHeader();
+								if (!path || !header) throw new Error("The continuation Session has no durable identity");
+								const createdAt = header.timestamp;
+								const targetPath = canonicalPath(path);
+								const record: SessionRecord = {
+									id: sessionManager.getSessionId(),
+									path: targetPath,
+									cwd: sourceCwd,
+									title,
+									taskId: checkpoint.task.taskId,
+									assignmentSource: sourceAssignment,
+									parentPath: canonicalSource,
+									parentId: identity.session.id,
+									rootSessionId: sourceRootId,
+									kind: "continuation",
+									confidence: 1,
+									locked: false,
+									createdAt,
+									updatedAt: createdAt,
+									card: {
+										originalName: title,
+										recentUserMessages: [],
+										files: checkpoint.state.files,
 										createdAt,
 										updatedAt: createdAt,
-										card: {
-											originalName: title,
-											recentUserMessages: [],
-											files: checkpoint.state.files,
-											createdAt,
-											updatedAt: createdAt,
-											parentSession: canonicalSource,
-											sessionId: sessionManager.getSessionId(),
-										},
-									};
-									journal!.target = { sessionId: record.id, sessionPath: targetPath, record };
-									journal!.state = "SWITCHING";
-									journal!.attempts += 1;
-									await writeHandoffJournal(journal!);
-									sessionManager.appendSessionInfo(title);
-									sessionManager.appendCustomMessageEntry(CUSTOM_TYPE, checkpointMarkdown(checkpoint), true, checkpoint);
-									sessionManager.appendMessage({
-										role: "assistant",
-										content: [{ type: "text", text: "Continuation checkpoint loaded. The Session is ready." }],
-										api: ctx.model!.api,
-										provider: ctx.model!.provider,
-										model: ctx.model!.id,
-										usage: emptyUsage(),
-										stopReason: "stop",
-										timestamp: Date.now(),
-									});
-									const entries = sessionManager.getEntries();
-									record.card.firstEntryId = entries[0]?.id;
-									record.card.latestEntryId = entries.at(-1)?.id;
-									await verifyTargetSession(targetPath, record.id, journal!.handoffId);
-									await writeHandoffJournal(journal!);
-								},
-								withSession: finishReplacement,
-							});
-							cancelled = result.cancelled;
-						}
-						switched = !cancelled;
-						lastError = undefined;
-						break;
-					} catch (error) {
-						lastError = error;
-						if (!(journal.target && await targetExists(journal))) {
-							journal.state = "PREPARED";
-							journal.target = undefined;
-						}
-						journal.error = error instanceof Error ? error.message : String(error);
-						await writeHandoffJournal(journal);
-					}
+										parentSession: canonicalSource,
+										sessionId: sessionManager.getSessionId(),
+									},
+								};
+								journal!.target = { sessionId: record.id, sessionPath: targetPath, record };
+								journal!.state = "SWITCHING";
+								journal!.attempts += 1;
+								await writeHandoffJournal(journal!);
+								sessionManager.appendSessionInfo(title);
+								sessionManager.appendCustomMessageEntry(CUSTOM_TYPE, checkpointMarkdown(checkpoint), true, checkpoint);
+								sessionManager.appendMessage({
+									role: "assistant",
+									content: [{ type: "text", text: "Continuation checkpoint loaded. The Session is ready." }],
+									api: bootstrapModel.api,
+									provider: bootstrapModel.provider,
+									model: bootstrapModel.id,
+									usage: emptyUsage(),
+									stopReason: "stop",
+									timestamp: Date.now(),
+								});
+								const entries = sessionManager.getEntries();
+								record.card.firstEntryId = entries[0]?.id;
+								record.card.latestEntryId = entries.at(-1)?.id;
+								await verifyTargetSession(targetPath, record.id, journal!.handoffId);
+								await writeHandoffJournal(journal!);
+							} catch (error) {
+								setupError = error;
+							}
+						},
+						withSession: finishReplacement,
+					})).cancelled;
 				}
 				if (cancelled) {
 					journal.state = "FAILED";
 					journal.error = "Session switch was cancelled";
 					await writeHandoffJournal(journal);
 					ctx.ui.notify("Handoff cancelled", "info");
-					return;
 				}
-				if (!switched) throw lastError ?? new Error("The continuation Session could not be created");
 			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
 				if (journal) {
 					journal.state = journal.target && await targetExists(journal) ? "SWITCHING" : "FAILED";
-					journal.error = error instanceof Error ? error.message : String(error);
+					journal.error = message;
 					await writeHandoffJournal(journal).catch(() => undefined);
 				}
-				ctx.ui.notify(`Handoff failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+				// A session replacement invalidates the original command context even
+				// when setup fails. Never let a second stale-context error escape here.
+				try {
+					ctx.ui.notify(`Handoff failed: ${message}`, "error");
+				} catch {
+					console.error(`[pi-task-manager] Handoff failed: ${message}`);
+				}
 			} finally {
 				activeOperations().delete(canonicalSource);
 			}
