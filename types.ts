@@ -1,4 +1,5 @@
 export type SessionKind = "session" | "fork" | "clone" | "continuation";
+export type AssignmentSource = "provisional" | "organized" | "manual";
 
 export interface SessionCard {
 	originalName?: string;
@@ -20,6 +21,7 @@ export interface SessionRecord {
 	cwd: string;
 	title?: string;
 	taskId?: string;
+	assignmentSource: AssignmentSource;
 	parentPath?: string;
 	parentId?: string;
 	rootSessionId?: string;
@@ -37,6 +39,7 @@ export interface TaskRecord {
 	id: string;
 	title: string;
 	objective?: string;
+	provisional: boolean;
 	locked: boolean;
 	createdAt: string;
 	updatedAt: string;

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, readdir, stat } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { basename } from "node:path";
-import { isGeneratedHandoffMessage } from "./handoff.ts";
+import { isGeneratedHandoffMessage } from "./checkpoint.ts";
 import { canonicalPath, readProject, updateProject } from "./store.ts";
 import type {
 	FileFingerprint,
@@ -18,7 +18,6 @@ import type {
 
 const BATCH_SIZE = 25;
 const FILE_CONCURRENCY = 12;
-const UNCLASSIFIED_TASK_ID = "unclassified";
 const MIN_CONFIDENCE = 0.55;
 
 interface AiSessionResult {
@@ -318,6 +317,7 @@ async function scanProject(
 			forkPoint: existing?.forkPoint,
 			confidence: existing?.confidence,
 			lastHandoffLeafId: existing?.lastHandoffLeafId,
+			assignmentSource: existing?.assignmentSource ?? (parsed.continuationTaskId ? "organized" : "provisional"),
 			locked: existing?.locked ?? false,
 			createdAt: card.createdAt,
 			updatedAt: card.updatedAt,
@@ -417,7 +417,7 @@ function buildPrompt(
 		"For every fork/clone/continuation item, return only a concise branchTitle; its task is inherited from its parent.",
 		"Titles should describe the actual work, not generic phrases such as 'Coding session'. Preserve the language used in the card when practical.",
 		'Exact schema: {"sessions":[{"id":"...","sessionTitle":"...","taskId":"existing-id or new:key","taskTitle":"...","confidence":0.8}],"branches":[{"id":"...","branchTitle":"..."}]}',
-		`Existing tasks: ${JSON.stringify(tasks.map(({ id, title }) => ({ id, title })))}`,
+		`Existing organized/manual tasks: ${JSON.stringify(tasks.filter((task) => !task.provisional).map(({ id, title }) => ({ id, title })))}`,
 		`Session cards: ${JSON.stringify(cards)}`,
 	].join("\n\n");
 }
@@ -449,13 +449,22 @@ async function classifyBatch(
 	return parseAiJson(text);
 }
 
-function ensureUnclassified(tasks: TaskRecord[]): TaskRecord {
-	let task = tasks.find((item) => item.id === UNCLASSIFIED_TASK_ID);
+function ensureProvisionalTask(project: ProjectIndex, session: SessionRecord): TaskRecord {
+	const taskId = `task:${session.id}`;
+	let task = project.tasks.find((item) => item.id === taskId);
 	if (!task) {
-		const now = new Date().toISOString();
-		task = { id: UNCLASSIFIED_TASK_ID, title: "Unclassified", locked: false, createdAt: now, updatedAt: now };
-		tasks.push(task);
+		task = {
+			id: taskId,
+			title: session.title ?? session.card.originalName ?? compactText(session.card.firstUserMessage ?? basename(session.path), 90),
+			provisional: true,
+			locked: false,
+			createdAt: session.createdAt,
+			updatedAt: session.updatedAt,
+		};
+		project.tasks.push(task);
 	}
+	session.taskId = task.id;
+	session.assignmentSource = "provisional";
 	return task;
 }
 
@@ -510,20 +519,21 @@ export async function organizeProject(
 			const confidence = Number.isFinite(item.confidence) ? Math.max(0, Math.min(1, item.confidence)) : 0;
 			session.confidence = confidence;
 			if (confidence < MIN_CONFIDENCE) {
-				session.taskId = ensureUnclassified(project.tasks).id;
+				ensureProvisionalTask(project, session);
 				classified++;
 				continue;
 			}
-			let task = project.tasks.find((candidate) => candidate.id === item.taskId);
+			let task = project.tasks.find((candidate) => candidate.id === item.taskId && !candidate.provisional);
 			if (!task && typeof item.taskId === "string" && item.taskId.startsWith("new:")) {
 				let taskId = newTaskIds.get(item.taskId);
 				if (!taskId) {
-					taskId = randomUUID();
+					taskId = `task:organized:${randomUUID()}`;
 					newTaskIds.set(item.taskId, taskId);
 					const now = new Date().toISOString();
 					task = {
 						id: taskId,
 						title: cleanTitle(item.taskTitle) ?? "Untitled task",
+						provisional: false,
 						locked: false,
 						createdAt: now,
 						updatedAt: now,
@@ -531,13 +541,19 @@ export async function organizeProject(
 					project.tasks.push(task);
 				} else task = project.tasks.find((candidate) => candidate.id === taskId);
 			}
-			if (!task) task = ensureUnclassified(project.tasks);
+			if (!task) {
+				ensureProvisionalTask(project, session);
+				classified++;
+				continue;
+			}
 			if (!task.locked) {
 				const taskTitle = cleanTitle(item.taskTitle);
 				if (taskTitle) task.title = taskTitle;
+				task.provisional = false;
 				task.updatedAt = new Date().toISOString();
 			}
 			session.taskId = task.id;
+			session.assignmentSource = "organized";
 			classified++;
 		}
 
@@ -552,13 +568,14 @@ export async function organizeProject(
 
 	for (const root of roots) {
 		if (!root.title) root.title = root.card.originalName ?? compactText(root.card.firstUserMessage ?? basename(root.path), 90);
-		if (!root.taskId) root.taskId = ensureUnclassified(project.tasks).id;
+		if (!root.taskId || !project.tasks.some((task) => task.id === root.taskId)) ensureProvisionalTask(project, root);
 		root.rootSessionId = root.id;
 	}
 	for (const branch of branches) {
 		const root = findRoot(branch, byId);
 		branch.rootSessionId = root.id;
-		branch.taskId = root.taskId ?? ensureUnclassified(project.tasks).id;
+		branch.taskId = root.taskId;
+		branch.assignmentSource = root.assignmentSource;
 		if (!branch.title) {
 			const kind = branch.kind === "continuation" ? "Continuation" : branch.kind === "clone" ? "Clone" : "Fork";
 			branch.title = branch.card.originalName ?? `${kind} ${branch.id.slice(-6)}`;
@@ -578,6 +595,7 @@ export async function organizeProject(
 			if (manual?.locked) {
 				session.title = manual.title;
 				session.taskId = manual.taskId;
+				session.assignmentSource = "manual";
 				session.locked = true;
 			}
 		}
@@ -587,6 +605,7 @@ export async function organizeProject(
 			const root = findRoot(branch, committedById);
 			branch.rootSessionId = root.id;
 			branch.taskId = root.taskId;
+			branch.assignmentSource = root.assignmentSource;
 		}
 		const latestTasks = new Map(latest.tasks.map((task) => [task.id, task]));
 		for (const task of project.tasks) {

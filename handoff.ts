@@ -1,411 +1,189 @@
-import { randomUUID } from "node:crypto";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	SessionEntry,
+import {
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import {
+	CUSTOM_TYPE,
+	GENERATED_MARKER_PREFIX,
+	activeMonitors,
+	checkpointMarkdown,
+	collectAuthority,
+	compactText,
+	continuationPrompt,
+	generateCheckpoint,
+	referencedAuthority,
+	waitingPrompt,
+	type ContinuationCheckpoint,
+} from "./checkpoint.ts";
+import {
+	listHandoffJournals,
+	targetExists,
+	writeHandoffJournal,
+	type HandoffJournal,
+} from "./handoff-journal.ts";
+import { currentSession, ensureSessionIdentity } from "./identity.ts";
 import { canonicalPath, readProject, updateProject } from "./store.ts";
-import type { ProjectIndex, SessionRecord, TaskRecord } from "./types.ts";
+import type { SessionRecord, TaskRecord } from "./types.ts";
 
-const CUSTOM_TYPE = "pi-task-manager-continuation";
-const REQUEST_MARKER_PREFIX = "pi-task-manager:checkpoint-request:";
-const AUTO_CONTINUE_MARKER = "pi-task-manager:auto-continue";
-const READY_MARKER = "pi-task-manager:continuation-ready";
+export { isGeneratedHandoffMessage } from "./checkpoint.ts";
+
 const AUTO_HANDOFF_PERCENT = 35;
-const HANDOFF_TIMEOUT_MS = 15 * 60 * 1000;
+const SESSION_ATTEMPTS = 2;
 
-interface EvidenceItem {
-	work: string;
-	userEvidence: string;
+type NewSessionOptions = NonNullable<Parameters<ExtensionCommandContext["newSession"]>[0]>;
+type ReplacementContext = Parameters<NonNullable<NewSessionOptions["withSession"]>>[0];
+
+const operationsKey = Symbol.for("pi-task-manager.handoff-operations");
+type OperationHolder = typeof globalThis & { [operationsKey]?: Set<string> };
+
+function activeOperations(): Set<string> {
+	const holder = globalThis as OperationHolder;
+	return holder[operationsKey] ??= new Set<string>();
 }
 
-interface CompletedItem {
-	fact: string;
-	evidence: string;
-}
-
-interface ExtractedCheckpoint {
-	taskObjective: string;
-	activeIntent: {
-		request: string;
-		expectedOutcome: string;
-		userEvidence: string;
-	};
-	completed: CompletedItem[];
-	explicitUnfinished: EvidenceItem[];
-	awaitingUser: string[];
-	nonBindingNotes: string[];
-	files: string[];
-	verification: string[];
-	constraints: string[];
-}
-
-interface ContinuationCheckpoint extends ExtractedCheckpoint {
-	schemaVersion: 1;
-	task: {
-		id: string;
-		title: string;
-		objective: string;
-		locked: boolean;
-	};
-	source: {
-		sessionId: string;
-		sessionPath: string;
-		leafEntryId?: string;
-		checkpointEntryId: string;
-		createdAt: string;
-	};
-}
-
-type HandoffOutcome =
-	| { status: "success"; checkpoint: ExtractedCheckpoint }
-	| { status: "cancelled" }
-	| { status: "error"; message: string };
-
-interface PendingHandoff {
-	marker: string;
-	authorityTexts: string[];
-	resolve: (outcome: HandoffOutcome) => void;
-	timeout: ReturnType<typeof setTimeout>;
-}
-
-function compactText(value: string, maximum = 1200): string {
-	const text = value.replace(/\s+/g, " ").trim();
-	return text.length <= maximum ? text : `${text.slice(0, maximum - 1).trimEnd()}…`;
-}
-
-function contentText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((part): part is { type: "text"; text: string } =>
-			typeof part === "object"
-			&& part !== null
-			&& (part as { type?: unknown }).type === "text"
-			&& typeof (part as { text?: unknown }).text === "string")
-		.map((part) => part.text)
-		.join("\n");
-}
-
-export function isGeneratedHandoffMessage(text: string): boolean {
-	return text.includes(REQUEST_MARKER_PREFIX) || text.includes(AUTO_CONTINUE_MARKER) || text.includes(READY_MARKER);
-}
-
-function priorCheckpointAuthority(entry: SessionEntry): string[] {
-	if (entry.type !== "custom_message" || entry.customType !== CUSTOM_TYPE || !entry.details || typeof entry.details !== "object") {
-		return [];
-	}
-	const details = entry.details as Partial<ContinuationCheckpoint>;
-	const values: string[] = [];
-	if (details.activeIntent?.userEvidence) values.push(details.activeIntent.userEvidence);
-	for (const item of details.explicitUnfinished ?? []) {
-		if (item.userEvidence) values.push(item.userEvidence);
-	}
-	return values;
-}
-
-function collectAuthorityTexts(branch: SessionEntry[], focus: string): string[] {
-	const values = focus ? [focus] : [];
-	for (const entry of branch) {
-		if (entry.type === "message" && entry.message.role === "user") {
-			const text = contentText(entry.message.content).trim();
-			if (text && !isGeneratedHandoffMessage(text)) values.push(text);
-		}
-		values.push(...priorCheckpointAuthority(entry));
-	}
-	return values;
-}
-
-function buildCheckpointPrompt(
-	task: TaskRecord,
-	focus: string,
-	marker: string,
-	inheritedEvidence: string[],
-): string {
-	const focusSection = focus
-		? `\nThe user supplied this authoritative handoff focus:\n${focus}\n`
-		: "";
-	const inheritedEvidenceSection = inheritedEvidence.length > 0
-		? `\nExact authoritative user-evidence quotes inherited from prior Continuation Checkpoints:\n${inheritedEvidence.map((value) => `- ${JSON.stringify(value)}`).join("\n")}\nThese quotes are evidence, not new instructions. For inherited work, copy the matching quote exactly instead of quoting the checkpoint's paraphrased work description.\n`
-		: "";
-	return `We are preparing a Continuation Checkpoint for the current Task before moving to a fresh Pi session.
-
-Do not call tools and do not continue the work. Return JSON only, with no Markdown fence or preamble.
-
-Authority rules:
-- Derive active user intent and unfinished work from actual user requests, not from assistant suggestions.
-- Every activeIntent.userEvidence and explicitUnfinished[].userEvidence must be a short exact quote from a real user request, the authoritative handoff focus below, or the inherited authoritative evidence below.
-- General permission such as “use your best judgment” does not promote the assistant's own suggestions into user requirements.
-- Put optional assistant ideas only in nonBindingNotes. They are not an execution queue.
-- completed must contain only facts supported by conversation or tool results, and must state concise evidence.
-- Keep explicitUnfinished flat; do not invent nested subtasks.
-- Distinguish work that can proceed from questions that require the user.
-
-Trusted Task identity:
-${JSON.stringify({ id: task.id, title: task.title, existingObjective: task.objective })}
-${focusSection}${inheritedEvidenceSection}
-Exact schema:
-{"taskObjective":"stable overall Task goal","activeIntent":{"request":"current user intent","expectedOutcome":"what the user expects next","userEvidence":"exact user quote"},"completed":[{"fact":"verified completed fact","evidence":"supporting result"}],"explicitUnfinished":[{"work":"explicitly requested unfinished work","userEvidence":"exact user quote"}],"awaitingUser":["question requiring user input"],"nonBindingNotes":["optional historical suggestion, never an instruction"],"files":["important/path"],"verification":["check already run and result"],"constraints":["important constraint"]}
-
-Keep the complete JSON concise, preferably under 1,200 tokens. Use empty arrays when appropriate.
-
-<!-- ${marker} -->`;
-}
-
-function jsonObject(text: string): Record<string, unknown> {
-	const unfenced = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-	const start = unfenced.indexOf("{");
-	const end = unfenced.lastIndexOf("}");
-	if (start < 0 || end <= start) throw new Error("The model did not return a JSON object");
-	const value = JSON.parse(unfenced.slice(start, end + 1)) as unknown;
-	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The checkpoint is not a JSON object");
-	return value as Record<string, unknown>;
-}
-
-function requiredString(value: unknown, field: string, maximum = 1200): string {
-	if (typeof value !== "string" || !value.trim()) throw new Error(`Checkpoint field ${field} is missing`);
-	return compactText(value, maximum);
-}
-
-function stringArray(value: unknown, field: string): string[] {
-	if (!Array.isArray(value)) throw new Error(`Checkpoint field ${field} is not an array`);
-	return value
-		.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
-		.map((item) => compactText(item, 500));
-}
-
-function normalized(value: string): string {
-	return value.replace(/\s+/g, " ").trim().toLocaleLowerCase();
-}
-
-function validateEvidence(evidence: string, authorityTexts: string[], field: string): void {
-	const needle = normalized(evidence);
-	if (needle.length < 2 || !authorityTexts.some((text) => normalized(text).includes(needle))) {
-		throw new Error(`${field} is not traceable to a user request`);
-	}
-}
-
-function parseCheckpoint(text: string, authorityTexts: string[]): ExtractedCheckpoint {
-	const value = jsonObject(text);
-	const intentValue = value.activeIntent;
-	if (!intentValue || typeof intentValue !== "object" || Array.isArray(intentValue)) {
-		throw new Error("Checkpoint field activeIntent is missing");
-	}
-	const intent = intentValue as Record<string, unknown>;
-	const activeIntent = {
-		request: requiredString(intent.request, "activeIntent.request"),
-		expectedOutcome: requiredString(intent.expectedOutcome, "activeIntent.expectedOutcome"),
-		userEvidence: requiredString(intent.userEvidence, "activeIntent.userEvidence", 300),
-	};
-	validateEvidence(activeIntent.userEvidence, authorityTexts, "activeIntent.userEvidence");
-
-	if (!Array.isArray(value.completed)) throw new Error("Checkpoint field completed is not an array");
-	const completed = value.completed.map((item, index): CompletedItem => {
-		if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`completed[${index}] is invalid`);
-		const record = item as Record<string, unknown>;
-		return {
-			fact: requiredString(record.fact, `completed[${index}].fact`, 500),
-			evidence: requiredString(record.evidence, `completed[${index}].evidence`, 500),
-		};
-	});
-
-	if (!Array.isArray(value.explicitUnfinished)) throw new Error("Checkpoint field explicitUnfinished is not an array");
-	const explicitUnfinished = value.explicitUnfinished.map((item, index): EvidenceItem => {
-		if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`explicitUnfinished[${index}] is invalid`);
-		const record = item as Record<string, unknown>;
-		const result = {
-			work: requiredString(record.work, `explicitUnfinished[${index}].work`, 500),
-			userEvidence: requiredString(record.userEvidence, `explicitUnfinished[${index}].userEvidence`, 300),
-		};
-		validateEvidence(result.userEvidence, authorityTexts, `explicitUnfinished[${index}].userEvidence`);
-		return result;
-	});
-
+function emptyUsage() {
 	return {
-		taskObjective: requiredString(value.taskObjective, "taskObjective"),
-		activeIntent,
-		completed,
-		explicitUnfinished,
-		awaitingUser: stringArray(value.awaitingUser, "awaitingUser"),
-		nonBindingNotes: stringArray(value.nonBindingNotes, "nonBindingNotes"),
-		files: stringArray(value.files, "files"),
-		verification: stringArray(value.verification, "verification"),
-		constraints: stringArray(value.constraints, "constraints"),
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
 }
 
-function findHandoffOutcome(branch: SessionEntry[], pending: PendingHandoff): HandoffOutcome | undefined {
-	let requestIndex = -1;
-	for (let index = branch.length - 1; index >= 0; index--) {
-		const entry = branch[index];
-		if (entry.type === "message" && entry.message.role === "user" && contentText(entry.message.content).includes(pending.marker)) {
-			requestIndex = index;
-			break;
-		}
-	}
-	if (requestIndex < 0) return undefined;
-
-	let response: Extract<SessionEntry, { type: "message" }> | undefined;
-	let unexpectedlyCalledTool = false;
-	for (let index = requestIndex + 1; index < branch.length; index++) {
-		const entry = branch[index];
-		if (entry.type !== "message") continue;
-		if (entry.message.role === "user" && !isGeneratedHandoffMessage(contentText(entry.message.content))) {
-			return { status: "error", message: "The conversation changed while the checkpoint was being generated; run /task-handoff again" };
-		}
-		if (entry.message.role === "assistant") {
-			response = entry;
-			unexpectedlyCalledTool ||= entry.message.content.some((part) => part.type === "toolCall");
-		}
-	}
-	if (!response) return undefined;
-	const message = response.message;
-	if (message.role !== "assistant") return undefined;
-	if (unexpectedlyCalledTool) {
-		return { status: "error", message: "Checkpoint generation unexpectedly called a tool" };
-	}
-	if (message.stopReason === "aborted") return { status: "cancelled" };
-	if (message.stopReason === "error") return { status: "error", message: message.errorMessage ?? "Checkpoint generation failed" };
-	const text = contentText(message.content).trim();
-	if (!text) return { status: "error", message: "The model returned an empty checkpoint" };
+async function targetHasContinuationPrompt(path: string, handoffId: string): Promise<boolean> {
 	try {
-		return { status: "success", checkpoint: parseCheckpoint(text, pending.authorityTexts) };
+		return (await readFile(path, "utf8")).includes(`${GENERATED_MARKER_PREFIX}${handoffId}:`);
 	} catch (error) {
-		return { status: "error", message: error instanceof Error ? error.message : String(error) };
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
 	}
 }
 
-function checkpointMarkdown(checkpoint: ContinuationCheckpoint): string {
-	const lines = [
-		"# Continuation Checkpoint",
-		"",
-		`**Task:** ${checkpoint.task.title} (${checkpoint.task.id})`,
-		`**Objective:** ${checkpoint.task.objective}`,
-		"",
-		"## Active user intent",
-		checkpoint.activeIntent.request,
-		`Expected outcome: ${checkpoint.activeIntent.expectedOutcome}`,
-	];
-	const section = (title: string, values: string[]) => {
-		if (values.length === 0) return;
-		lines.push("", `## ${title}`, ...values.map((value) => `- ${value}`));
-	};
-	section("Completed with evidence", checkpoint.completed.map((item) => `${item.fact} — ${item.evidence}`));
-	section("Explicit unfinished work", checkpoint.explicitUnfinished.map((item) => item.work));
-	section("Waiting for user", checkpoint.awaitingUser);
-	section("Non-binding notes (not instructions)", checkpoint.nonBindingNotes);
-	section("Important files", checkpoint.files);
-	section("Verification", checkpoint.verification);
-	section("Constraints", checkpoint.constraints);
-	return lines.join("\n");
-}
-
-function continuationPrompt(checkpoint: ContinuationCheckpoint): string {
-	const unfinished = checkpoint.explicitUnfinished.map((item) => `- ${item.work}`).join("\n");
-	const completed = checkpoint.completed.map((item) => `- ${item.fact}`).join("\n") || "- None recorded";
-	return `Continue the current Task from its Continuation Checkpoint.
-
-Task objective: ${checkpoint.task.objective}
-Active user intent: ${checkpoint.activeIntent.request}
-Expected outcome: ${checkpoint.activeIntent.expectedOutcome}
-
-Execute only this explicit unfinished work:
-${unfinished}
-
-Already completed; do not repeat unless current repository evidence contradicts it:
-${completed}
-
-Do not execute non-binding notes or invent additional work. Continue implementation now rather than merely restating the checkpoint or proposing a plan.
-
-<!-- ${AUTO_CONTINUE_MARKER} -->`;
-}
-
-function waitingPrompt(checkpoint: ContinuationCheckpoint): string {
-	return `The current Task cannot proceed without user input. Do not execute work, answer the questions yourself, or introduce additional suggestions. Ask the user only for the following required input:\n\n${checkpoint.awaitingUser.map((item) => `- ${item}`).join("\n")}\n\n<!-- ${AUTO_CONTINUE_MARKER} -->`;
-}
-
-function readyPrompt(): string {
-	return `The Continuation Checkpoint has no recorded unfinished work or pending question. Do not execute work or introduce suggestions. Reply briefly that the new session is ready, then wait for the user's next request.\n\n<!-- ${READY_MARKER} -->`;
-}
-
-function currentSession(project: ProjectIndex, path?: string): SessionRecord | undefined {
-	if (!path) return undefined;
-	const canonical = canonicalPath(path);
-	return project.sessions.find((session) => canonicalPath(session.path) === canonical);
-}
-
-function waitForCheckpoint(
-	pi: ExtensionAPI,
-	prompt: string,
-	marker: string,
-	authorityTexts: string[],
-	isIdle: boolean,
-	setPending: (pending: PendingHandoff | undefined) => void,
-): Promise<HandoffOutcome> {
-	return new Promise((resolve) => {
-		const timeout = setTimeout(() => {
-			setPending(undefined);
-			resolve({ status: "error", message: "Timed out waiting for the checkpoint response" });
-		}, HANDOFF_TIMEOUT_MS);
-		setPending({ marker, authorityTexts, resolve, timeout });
-		pi.sendUserMessage(prompt, isIdle ? undefined : { deliverAs: "followUp" });
+async function verifyTargetSession(path: string, sessionId: string, handoffId: string): Promise<void> {
+	const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+	if (lines.length < 2) throw new Error("The continuation Session file is incomplete");
+	const header = JSON.parse(lines[0]!) as { type?: unknown; id?: unknown };
+	if (header.type !== "session" || header.id !== sessionId) throw new Error("The continuation Session header does not match the transaction");
+	const found = lines.slice(1).some((line) => {
+		try {
+			const entry = JSON.parse(line) as { type?: unknown; customType?: unknown; details?: { source?: { handoffId?: unknown } } };
+			return entry.type === "custom_message" && entry.customType === CUSTOM_TYPE && entry.details?.source?.handoffId === handoffId;
+		} catch {
+			return false;
+		}
 	});
+	if (!found) throw new Error("The continuation checkpoint was not persisted");
 }
 
-export function registerHandoff(
-	pi: ExtensionAPI,
-	organizeIfNeeded?: (ctx: ExtensionCommandContext) => Promise<void>,
-): void {
-	let pendingHandoff: PendingHandoff | undefined;
+async function commitHandoff(journal: HandoffJournal): Promise<void> {
+	const checkpoint = journal.checkpoint;
+	if (!checkpoint) throw new Error("The handoff journal has no checkpoint to commit");
+	await updateProject(journal.source.cwd, (project) => {
+		let task = project.tasks.find((item) => item.id === checkpoint.task.taskId);
+		if (!task) {
+			task = {
+				id: checkpoint.task.taskId,
+				title: checkpoint.task.title,
+				objective: checkpoint.state.objective,
+				provisional: checkpoint.task.provisional,
+				locked: false,
+				createdAt: checkpoint.source.createdAt,
+				updatedAt: checkpoint.source.createdAt,
+			};
+			project.tasks.push(task);
+		}
+		task.objective ??= checkpoint.state.objective;
+		const source = project.sessions.find((item) => item.id === journal.source.sessionId);
+		if (source) source.lastHandoffLeafId = journal.source.leafId;
+		if (journal.target) {
+			project.sessions = project.sessions.filter((item) => item.id !== journal.target!.record.id);
+			project.sessions.push(journal.target.record);
+		}
+	});
+	journal.state = "COMMITTED";
+	journal.error = undefined;
+	await writeHandoffJournal(journal);
+}
+
+async function recoverPersistedHandoff(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	const path = ctx.sessionManager.getSessionFile();
+	if (!path) return;
+	const canonical = canonicalPath(path);
+	const journals = await listHandoffJournals();
+	for (const journal of journals) {
+		if (journal.state !== "SWITCHING" || journal.ownerPid === process.pid || !journal.target) continue;
+		if (canonicalPath(journal.target.sessionPath) !== canonical || !(await targetExists(journal))) continue;
+		await verifyTargetSession(journal.target.sessionPath, journal.target.sessionId, journal.handoffId);
+		await commitHandoff(journal);
+		const prompt = journal.checkpoint
+			? continuationPrompt(journal.checkpoint) ?? waitingPrompt(journal.checkpoint)
+			: undefined;
+		if (prompt && !(await targetHasContinuationPrompt(journal.target.sessionPath, journal.handoffId))) {
+			setImmediate(() => pi.sendUserMessage(prompt, { deliverAs: "followUp" }));
+		}
+		if (ctx.hasUI) ctx.ui.notify(`Recovered handoff ${journal.handoffId}`, "info");
+	}
+}
+
+async function reusableJournal(sourcePath: string, leafId: string | undefined, focus: string): Promise<HandoffJournal | undefined> {
+	const canonical = canonicalPath(sourcePath);
+	return (await listHandoffJournals())
+		.filter((journal) => journal.state !== "COMMITTED"
+			&& canonicalPath(journal.source.sessionPath) === canonical
+			&& journal.source.leafId === leafId
+			&& (journal.focus ?? "") === focus)
+		.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))[0];
+}
+
+export function registerHandoff(pi: ExtensionAPI): void {
 	let autoHandoffQueued = false;
 
-	const setPending = (value: PendingHandoff | undefined) => {
-		pendingHandoff = value;
-	};
-
-	pi.on("session_start", () => {
+	pi.on("session_start", async (_event, ctx) => {
 		autoHandoffQueued = false;
-	});
-
-	pi.on("session_shutdown", () => {
-		if (!pendingHandoff) return;
-		clearTimeout(pendingHandoff.timeout);
-		pendingHandoff.resolve({ status: "cancelled" });
-		pendingHandoff = undefined;
+		await recoverPersistedHandoff(pi, ctx);
+		const path = ctx.sessionManager.getSessionFile();
+		if (!path) return;
+		const activeTarget = (await listHandoffJournals()).some((journal) =>
+			journal.state === "SWITCHING"
+			&& journal.ownerPid === process.pid
+			&& journal.target
+			&& canonicalPath(journal.target.sessionPath) === canonicalPath(path));
+		if (!activeTarget) await ensureSessionIdentity(ctx);
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		if (pendingHandoff) {
-			const outcome = findHandoffOutcome(ctx.sessionManager.getBranch(), pendingHandoff);
-			if (!outcome) return;
-			const pending = pendingHandoff;
-			clearTimeout(pending.timeout);
-			pendingHandoff = undefined;
-			setImmediate(() => pending.resolve(outcome));
-			return;
-		}
-
 		if (autoHandoffQueued || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+		const path = ctx.sessionManager.getSessionFile();
+		if (path && (await listHandoffJournals()).some((journal) =>
+			journal.state === "SWITCHING"
+			&& journal.ownerPid === process.pid
+			&& journal.target
+			&& canonicalPath(journal.target.sessionPath) === canonicalPath(path))) return;
+		const identity = await ensureSessionIdentity(ctx);
+		if (!identity) return;
 		const project = await readProject(ctx.cwd);
 		if (!project.autoHandoff) return;
 		const usage = ctx.getContextUsage();
 		if (usage?.percent === null || usage?.percent === undefined || usage.percent < AUTO_HANDOFF_PERCENT) return;
-		const session = currentSession(project, ctx.sessionManager.getSessionFile());
 		const leafId = ctx.sessionManager.getLeafId() ?? undefined;
-		if (!session || session.lastHandoffLeafId === leafId) return;
+		const session = currentSession(project, ctx.sessionManager.getSessionFile());
+		if (!session || session.lastHandoffLeafId === leafId || activeOperations().has(session.path)) return;
 
 		autoHandoffQueued = true;
 		if (ctx.hasUI) ctx.ui.notify(
-			`Context usage reached ${usage.percent.toFixed(1)}%; preparing a Task continuation`,
+			`Context usage reached ${usage.percent.toFixed(1)}%; preparing a handoff`,
 			"info",
 		);
-		setImmediate(() => {
-			pi.sendUserMessage("/task-handoff", { deliverAs: "followUp", expandPromptTemplates: true });
-		});
+		setImmediate(() => pi.sendUserMessage("/handoff", { deliverAs: "followUp", expandPromptTemplates: true }));
 	});
 
-	pi.registerCommand("task-handoff-auto", {
-		description: "Enable or disable automatic Task continuation for this project",
+	pi.registerCommand("handoff-auto", {
+		description: "Enable or disable automatic handoff for this project",
 		getArgumentCompletions: (prefix) => ["on", "off"]
 			.filter((value) => value.startsWith(prefix.trim().toLowerCase()))
 			.map((value) => ({ value, label: value })),
@@ -413,193 +191,282 @@ export function registerHandoff(
 			const value = args.trim().toLowerCase();
 			if (!value) {
 				const project = await readProject(ctx.cwd);
-				ctx.ui.notify(`Automatic Task handoff is ${project.autoHandoff ? "on" : "off"}`, "info");
+				ctx.ui.notify(`Automatic handoff is ${project.autoHandoff ? "on" : "off"} (threshold ${AUTO_HANDOFF_PERCENT}%)`, "info");
 				return;
 			}
 			if (value !== "on" && value !== "off") {
-				ctx.ui.notify("Usage: /task-handoff-auto on|off", "error");
+				ctx.ui.notify("Usage: /handoff-auto on|off", "error");
 				return;
 			}
 			await updateProject(ctx.cwd, (project) => {
 				project.autoHandoff = value === "on";
 			});
 			autoHandoffQueued = false;
-			ctx.ui.notify(`Automatic Task handoff: ${value}`, "info");
+			ctx.ui.notify(`Automatic handoff: ${value}`, "info");
 		},
 	});
 
-	pi.registerCommand("task-handoff", {
-		description: "Create a structured checkpoint and continue the current Task in a new session",
+	pi.registerCommand("handoff", {
+		description: "Checkpoint this Task and continue it in a durable new Session",
 		handler: async (args, ctx: ExtensionCommandContext) => {
-			if (pendingHandoff) {
-				ctx.ui.notify("A Task handoff is already in progress", "warning");
-				return;
-			}
 			const automatic = autoHandoffQueued;
 			autoHandoffQueued = false;
-			if (!ctx.model) {
-				ctx.ui.notify("No model selected", "error");
-				return;
-			}
-			const cwd = ctx.cwd;
 			const sourcePath = ctx.sessionManager.getSessionFile();
-			let project = await readProject(cwd);
-			let sourceSession = currentSession(project, sourcePath);
-			let task = project.tasks.find((item) => item.id === sourceSession?.taskId);
-			if (sourcePath && (!sourceSession || !task) && organizeIfNeeded) {
-				ctx.ui.notify("Current session is not assigned to a Task; organizing before handoff", "info");
-				await organizeIfNeeded(ctx);
-				project = await readProject(cwd);
-				sourceSession = currentSession(project, sourcePath);
-				task = project.tasks.find((item) => item.id === sourceSession?.taskId);
-			}
-			if (!sourcePath || !sourceSession || !task) {
-				ctx.ui.notify("Current session could not be assigned to a Task", "warning");
+			if (!sourcePath) {
+				ctx.ui.notify("Handoff requires a persisted source Session", "error");
 				return;
 			}
+			const canonicalSource = canonicalPath(sourcePath);
+			if (activeOperations().has(canonicalSource)) {
+				ctx.ui.notify("A handoff is already in progress for this Session", "warning");
+				return;
+			}
+			activeOperations().add(canonicalSource);
 
-			const focus = compactText(args, 1200);
-			const sourceWorkLeafId = ctx.sessionManager.getLeafId() ?? undefined;
-			const branch = ctx.sessionManager.getBranch();
-			const inheritedEvidence = [...new Set(branch.flatMap(priorCheckpointAuthority))];
-			const authorityTexts = collectAuthorityTexts(branch, focus);
-			if (authorityTexts.length === 0) {
-				ctx.ui.notify("No user request is available to hand off", "warning");
-				return;
-			}
-			const marker = `${REQUEST_MARKER_PREFIX}${randomUUID()}`;
-			const outcome = await waitForCheckpoint(
-				pi,
-				buildCheckpointPrompt(task, focus, marker, inheritedEvidence),
-				marker,
-				authorityTexts,
-				ctx.isIdle(),
-				setPending,
-			);
-			if (outcome.status === "cancelled") {
-				ctx.ui.notify("Task handoff cancelled", "info");
-				return;
-			}
-			if (outcome.status === "error") {
-				autoHandoffQueued = false;
-				ctx.ui.notify(`Task handoff failed: ${outcome.message}`, "error");
-				return;
-			}
-
-			const latest = await readProject(cwd);
-			const latestSource = currentSession(latest, sourcePath);
-			const latestTask = latestSource && latest.tasks.find((item) => item.id === latestSource.taskId);
-			if (!latestSource || !latestTask || latestTask.id !== task.id) {
-				ctx.ui.notify("Task assignment changed while the checkpoint was being generated; run /task-handoff again", "warning");
-				return;
-			}
-			const checkpointEntryId = ctx.sessionManager.getLeafId();
-			if (!checkpointEntryId) {
-				ctx.ui.notify("Checkpoint response was not saved", "error");
-				return;
-			}
-			const objective = latestTask.objective ?? outcome.checkpoint.taskObjective;
-			const checkpoint: ContinuationCheckpoint = {
-				...outcome.checkpoint,
-				taskObjective: objective,
-				schemaVersion: 1,
-				task: {
-					id: latestTask.id,
-					title: latestTask.title,
-					objective,
-					locked: latestTask.locked,
-				},
-				source: {
-					sessionId: latestSource.id,
-					sessionPath: latestSource.path,
-					leafEntryId: sourceWorkLeafId,
-					checkpointEntryId,
-					createdAt: new Date().toISOString(),
-				},
-			};
-
-			if (automatic && checkpoint.explicitUnfinished.length === 0 && checkpoint.awaitingUser.length === 0) {
-				await updateProject(cwd, (current) => {
-					const source = current.sessions.find((item) => item.id === latestSource.id);
-					const currentTask = current.tasks.find((item) => item.id === latestTask.id);
-					if (source) source.lastHandoffLeafId = checkpointEntryId;
-					if (currentTask && !currentTask.objective) currentTask.objective = objective;
-				});
-				ctx.ui.notify("Checkpoint found no unfinished work or pending user question; staying in this session", "info");
-				return;
-			}
-
-			const title = compactText(`Continuation · ${latestSource.title ?? latestTask.title}`, 90);
-			const statusText = latestTask.title;
-			const result = await ctx.newSession({
-				parentSession: latestSource.path,
-				setup: async (sessionManager) => {
-					sessionManager.appendSessionInfo(title);
-					sessionManager.appendCustomMessageEntry(
-						CUSTOM_TYPE,
-						checkpointMarkdown(checkpoint),
-						true,
-						checkpoint,
-					);
-					const path = sessionManager.getSessionFile();
-					if (!path) throw new Error("The continuation session was not persisted");
-					const header = sessionManager.getHeader();
-					if (!header) throw new Error("The continuation session has no header");
-					const entries = sessionManager.getEntries();
-					const createdAt = header.timestamp;
-					const record: SessionRecord = {
-						id: sessionManager.getSessionId(),
-						path: canonicalPath(path),
-						cwd: canonicalPath(cwd),
-						title,
-						taskId: latestTask.id,
-						parentPath: canonicalPath(latestSource.path),
-						parentId: latestSource.id,
-						rootSessionId: latestSource.rootSessionId ?? latestSource.id,
-						kind: "continuation",
-						confidence: 1,
-						locked: false,
-						createdAt,
-						updatedAt: createdAt,
-						card: {
-							originalName: title,
-							recentUserMessages: [],
-							files: checkpoint.files,
-							createdAt,
-							updatedAt: createdAt,
-							parentSession: canonicalPath(latestSource.path),
-							sessionId: sessionManager.getSessionId(),
-							firstEntryId: entries[0]?.id,
-							latestEntryId: entries.at(-1)?.id,
+			let journal: HandoffJournal | undefined;
+			try {
+				if (!ctx.model) throw new Error("No model selected");
+				await ctx.waitForIdle();
+				const focus = compactText(args, 1200);
+				let sourceLeafId = ctx.sessionManager.getLeafId() ?? undefined;
+				const identity = await ensureSessionIdentity(ctx);
+				if (!identity) throw new Error("Current Session could not receive a provisional Task identity");
+				journal = await reusableJournal(canonicalSource, sourceLeafId, focus);
+				if (!journal) {
+					const now = new Date().toISOString();
+					journal = {
+						version: 1,
+						handoffId: randomUUID(),
+						state: "PREPARING",
+						ownerPid: process.pid,
+						automatic,
+						focus: focus || undefined,
+						source: {
+							cwd: canonicalPath(ctx.cwd),
+							sessionId: identity.session.id,
+							sessionPath: canonicalSource,
+							leafId: sourceLeafId,
 						},
+						attempts: 0,
+						createdAt: now,
+						updatedAt: now,
 					};
-					await updateProject(cwd, (current) => {
-						const source = current.sessions.find((item) => item.id === latestSource.id);
-						const currentTask = current.tasks.find((item) => item.id === latestTask.id);
-						if (source) source.lastHandoffLeafId = checkpointEntryId;
-						if (currentTask && !currentTask.objective) currentTask.objective = objective;
-						current.sessions = current.sessions.filter((item) => item.id !== record.id);
-						current.sessions.push(record);
-					});
-				},
-				withSession: async (replacementCtx) => {
-					replacementCtx.ui.setStatus(
-						"task-manager",
-						replacementCtx.ui.theme.fg("accent", statusText),
-					);
-					if (checkpoint.explicitUnfinished.length > 0) {
-						replacementCtx.ui.notify("Task checkpoint transferred. Continuing explicit unfinished work.", "info");
-						await replacementCtx.sendUserMessage(continuationPrompt(checkpoint));
-					} else if (checkpoint.awaitingUser.length > 0) {
-						replacementCtx.ui.notify("Task checkpoint transferred. Requesting the required user input.", "info");
-						await replacementCtx.sendUserMessage(waitingPrompt(checkpoint));
-					} else {
-						replacementCtx.ui.notify("Task checkpoint transferred to a new session.", "info");
-						await replacementCtx.sendUserMessage(readyPrompt());
+					await writeHandoffJournal(journal);
+				} else {
+					journal.ownerPid = process.pid;
+					journal.automatic = automatic;
+					journal.error = undefined;
+					await writeHandoffJournal(journal);
+				}
+
+				if (!journal.checkpoint) {
+					while (true) {
+						const branch = ctx.sessionManager.getBranch();
+						const authority = collectAuthority(branch, identity.session.id);
+						if (authority.length === 0) throw new Error("No authoritative user message is available to hand off");
+						journal.attempts += 1;
+						await writeHandoffJournal(journal);
+						const generated = await generateCheckpoint(ctx, journal.handoffId, focus, authority);
+						if (ctx.sessionManager.getLeafId() === sourceLeafId && ctx.isIdle() && !ctx.hasPendingMessages()) {
+							const latestProject = await readProject(ctx.cwd);
+							const latestSource = currentSession(latestProject, sourcePath);
+							const latestTask = latestSource?.taskId
+								? latestProject.tasks.find((task) => task.id === latestSource.taskId)
+								: undefined;
+							if (!latestSource || !latestTask) throw new Error("Task identity disappeared while preparing the checkpoint");
+							const monitors = await activeMonitors(sourcePath);
+							journal.checkpoint = {
+								schemaVersion: 2,
+								source: {
+									handoffId: journal.handoffId,
+									sessionId: latestSource.id,
+									sessionPath: canonicalSource,
+									leafId: sourceLeafId,
+									createdAt: new Date().toISOString(),
+								},
+								task: {
+									taskId: latestTask.id,
+									title: latestTask.title,
+									provisional: latestTask.provisional,
+								},
+								authority: referencedAuthority(generated, authority),
+								state: {
+									objective: generated.objective,
+									completed: generated.completed,
+									inProgress: generated.inProgress,
+									nextActions: generated.nextActions,
+									awaitingUser: generated.awaitingUser,
+									files: generated.files,
+									verification: generated.verification,
+									constraints: generated.constraints,
+									activeProcesses: generated.activeProcesses,
+									monitors,
+								},
+							};
+							journal.state = "PREPARED";
+							await writeHandoffJournal(journal);
+							break;
+						}
+						await ctx.waitForIdle();
+						sourceLeafId = ctx.sessionManager.getLeafId() ?? undefined;
+						journal.source.leafId = sourceLeafId;
+						journal.state = "PREPARING";
+						await writeHandoffJournal(journal);
 					}
-				},
-			});
-			if (result.cancelled) ctx.ui.notify("New continuation session cancelled", "info");
+				}
+
+				const checkpoint = journal.checkpoint;
+				if (automatic && checkpoint.state.inProgress.length === 0
+					&& checkpoint.state.nextActions.length === 0 && checkpoint.state.awaitingUser.length === 0) {
+					await commitHandoff(journal);
+					ctx.ui.notify("No unfinished work or pending user question was found; staying in this Session", "info");
+					return;
+				}
+
+				const continueText = continuationPrompt(checkpoint) ?? waitingPrompt(checkpoint);
+				const title = compactText(`Continuation · ${identity.session.title ?? checkpoint.task.title}`, 90);
+				const finishReplacement = async (replacementCtx: ReplacementContext): Promise<void> => {
+					replacementCtx.ui.setStatus("task-manager", replacementCtx.ui.theme.fg("accent", checkpoint.task.title));
+					let continuationError: unknown;
+					if (continueText) {
+						try {
+							await replacementCtx.sendUserMessage(continueText);
+						} catch (error) {
+							continuationError = error;
+							if (journal!.target && !(await targetHasContinuationPrompt(journal!.target.sessionPath, journal!.handoffId))) {
+								try {
+									await replacementCtx.sendUserMessage(continueText);
+									continuationError = undefined;
+								} catch (retryError) {
+									continuationError = retryError;
+								}
+							}
+						}
+					}
+					try {
+						await verifyTargetSession(journal!.target!.sessionPath, journal!.target!.sessionId, journal!.handoffId);
+						await commitHandoff(journal!);
+					} catch (error) {
+						journal!.state = "SWITCHING";
+						journal!.error = error instanceof Error ? error.message : String(error);
+						await writeHandoffJournal(journal!).catch(() => undefined);
+						replacementCtx.ui.notify(`Handoff recovery is pending: ${journal!.error}`, "error");
+						return;
+					}
+					if (checkpoint.state.monitors.length > 0) replacementCtx.ui.notify(
+						`${checkpoint.state.monitors.length} active monitor(s) were recorded; verify that the task-monitor extension transferred them to this Session`,
+						"warning",
+					);
+					if (continuationError) replacementCtx.ui.notify(
+						`Handoff committed, but automatic continuation failed: ${continuationError instanceof Error ? continuationError.message : String(continuationError)}`,
+						"error",
+					);
+					else replacementCtx.ui.notify(
+						continueText ? "Handoff committed and continuation started." : "Handoff committed; the new Session is ready.",
+						"info",
+					);
+				};
+
+				let cancelled = false;
+				let switched = false;
+				let lastError: unknown;
+				for (let attempt = 0; attempt < SESSION_ATTEMPTS; attempt++) {
+					try {
+						if (journal.target && await targetExists(journal)) {
+							await verifyTargetSession(journal.target.sessionPath, journal.target.sessionId, journal.handoffId);
+							const result = await ctx.switchSession(journal.target.sessionPath, { withSession: finishReplacement });
+							cancelled = result.cancelled;
+						} else {
+							const result = await ctx.newSession({
+								parentSession: canonicalSource,
+								setup: async (sessionManager) => {
+									const path = sessionManager.getSessionFile();
+									const header = sessionManager.getHeader();
+									if (!path || !header) throw new Error("The continuation Session has no durable identity");
+									const createdAt = header.timestamp;
+									const targetPath = canonicalPath(path);
+									const record: SessionRecord = {
+										id: sessionManager.getSessionId(),
+										path: targetPath,
+										cwd: canonicalPath(ctx.cwd),
+										title,
+										taskId: checkpoint.task.taskId,
+										assignmentSource: identity.session.assignmentSource,
+										parentPath: canonicalSource,
+										parentId: identity.session.id,
+										rootSessionId: identity.session.rootSessionId ?? identity.session.id,
+										kind: "continuation",
+										confidence: 1,
+										locked: false,
+										createdAt,
+										updatedAt: createdAt,
+										card: {
+											originalName: title,
+											recentUserMessages: [],
+											files: checkpoint.state.files,
+											createdAt,
+											updatedAt: createdAt,
+											parentSession: canonicalSource,
+											sessionId: sessionManager.getSessionId(),
+										},
+									};
+									journal!.target = { sessionId: record.id, sessionPath: targetPath, record };
+									journal!.state = "SWITCHING";
+									journal!.attempts += 1;
+									await writeHandoffJournal(journal!);
+									sessionManager.appendSessionInfo(title);
+									sessionManager.appendCustomMessageEntry(CUSTOM_TYPE, checkpointMarkdown(checkpoint), true, checkpoint);
+									sessionManager.appendMessage({
+										role: "assistant",
+										content: [{ type: "text", text: "Continuation checkpoint loaded. The Session is ready." }],
+										api: ctx.model!.api,
+										provider: ctx.model!.provider,
+										model: ctx.model!.id,
+										usage: emptyUsage(),
+										stopReason: "stop",
+										timestamp: Date.now(),
+									});
+									const entries = sessionManager.getEntries();
+									record.card.firstEntryId = entries[0]?.id;
+									record.card.latestEntryId = entries.at(-1)?.id;
+									await verifyTargetSession(targetPath, record.id, journal!.handoffId);
+									await writeHandoffJournal(journal!);
+								},
+								withSession: finishReplacement,
+							});
+							cancelled = result.cancelled;
+						}
+						switched = !cancelled;
+						lastError = undefined;
+						break;
+					} catch (error) {
+						lastError = error;
+						if (!(journal.target && await targetExists(journal))) {
+							journal.state = "PREPARED";
+							journal.target = undefined;
+						}
+						journal.error = error instanceof Error ? error.message : String(error);
+						await writeHandoffJournal(journal);
+					}
+				}
+				if (cancelled) {
+					journal.state = "FAILED";
+					journal.error = "Session switch was cancelled";
+					await writeHandoffJournal(journal);
+					ctx.ui.notify("Handoff cancelled", "info");
+					return;
+				}
+				if (!switched) throw lastError ?? new Error("The continuation Session could not be created");
+			} catch (error) {
+				if (journal) {
+					journal.state = journal.target && await targetExists(journal) ? "SWITCHING" : "FAILED";
+					journal.error = error instanceof Error ? error.message : String(error);
+					await writeHandoffJournal(journal).catch(() => undefined);
+				}
+				ctx.ui.notify(`Handoff failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			} finally {
+				activeOperations().delete(canonicalSource);
+			}
 		},
 	});
 }

@@ -117,7 +117,8 @@ async function applyTreeAction(
 		const title = value && compactTitle(value);
 		if (title) await updateProject(ctx.cwd, (latest) => {
 			const target = latest.tasks.find((item) => item.id === task.id);
-			if (target) Object.assign(target, { title, objective: title, locked: true, updatedAt: new Date().toISOString() });
+			if (target) Object.assign(target, { title, objective: title, provisional: false, locked: true, updatedAt: new Date().toISOString() });
+			for (const item of latest.sessions.filter((item) => item.taskId === task.id)) item.assignmentSource = "manual";
 		});
 	}
 	if (action.type === "rename-session" && session) {
@@ -133,16 +134,25 @@ async function applyTreeAction(
 		if (targetTaskId) await updateProject(ctx.cwd, (latest) => {
 			const root = latest.sessions.find((item) => item.id === session.id);
 			if (!root) return;
+			const targetTask = latest.tasks.find((item) => item.id === targetTaskId);
+			if (targetTask) targetTask.provisional = false;
 			root.taskId = targetTaskId;
+			root.assignmentSource = "manual";
 			root.locked = true;
-			for (const child of descendants(latest, root.id)) child.taskId = targetTaskId;
+			for (const child of descendants(latest, root.id)) {
+				child.taskId = targetTaskId;
+				child.assignmentSource = "manual";
+			}
 		});
 	}
 	if (action.type === "merge-task" && task) {
 		const targetTaskId = await selectTask(ctx, project, `Merge “${task.title}” into`, task.id);
 		if (targetTaskId) await updateProject(ctx.cwd, (latest) => {
+			const targetTask = latest.tasks.find((item) => item.id === targetTaskId);
+			if (targetTask) targetTask.provisional = false;
 			for (const item of latest.sessions.filter((candidate) => candidate.taskId === task.id)) {
 				item.taskId = targetTaskId;
+				item.assignmentSource = "manual";
 				if (!item.parentId) item.locked = true;
 			}
 			latest.tasks = latest.tasks.filter((candidate) => candidate.id !== task.id);
@@ -229,9 +239,7 @@ export default function taskManager(pi: ExtensionAPI) {
 		return { started: true, promise: job };
 	}
 
-	registerHandoff(pi, async (ctx) => {
-		await scheduleOrganize(ctx, false).promise;
-	});
+	registerHandoff(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
 		const project = await readProject(ctx.cwd);
@@ -344,7 +352,8 @@ export default function taskManager(pi: ExtensionAPI) {
 				const session = currentSession(project, path);
 				const task = session && project.tasks.find((item) => item.id === session.taskId);
 				if (!task) return;
-				Object.assign(task, { title, objective: title, locked: true, updatedAt: new Date().toISOString() });
+				Object.assign(task, { title, objective: title, provisional: false, locked: true, updatedAt: new Date().toISOString() });
+				for (const item of project.sessions.filter((item) => item.taskId === task.id)) item.assignmentSource = "manual";
 				renamed = true;
 			});
 			if (!renamed) {

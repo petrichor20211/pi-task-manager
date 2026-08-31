@@ -1,7 +1,7 @@
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
-import type { ProjectIndex, TaskManagerIndex } from "./types.ts";
+import type { AssignmentSource, ProjectIndex, SessionRecord, TaskManagerIndex } from "./types.ts";
 
 export const INDEX_PATH = join(getAgentDir(), "task-manager", "index.json");
 
@@ -26,6 +26,63 @@ export function emptyProject(cwd: string): ProjectIndex {
 		sessions: [],
 		fingerprints: {},
 	};
+}
+
+function inferredAssignmentSource(session: SessionRecord): AssignmentSource {
+	if (session.locked) return "manual";
+	return session.taskId?.startsWith("task:") ? "provisional" : "organized";
+}
+
+function rootOf(session: SessionRecord, byId: Map<string, SessionRecord>): SessionRecord {
+	let current = session;
+	const seen = new Set<string>();
+	while (current.parentId && !seen.has(current.id)) {
+		seen.add(current.id);
+		const parent = byId.get(current.parentId);
+		if (!parent) break;
+		current = parent;
+	}
+	return current;
+}
+
+function normalizeProject(project: ProjectIndex): ProjectIndex {
+	project.autoHandoff ??= false;
+	project.tasks ??= [];
+	project.sessions ??= [];
+	project.fingerprints ??= {};
+	for (const task of project.tasks) task.provisional ??= task.id.startsWith("task:");
+	for (const session of project.sessions) session.assignmentSource ??= inferredAssignmentSource(session);
+
+	// Migrate the old shared Unclassified bucket to one stable lineage per root Session.
+	const byId = new Map(project.sessions.map((session) => [session.id, session]));
+	for (const session of project.sessions) {
+		const root = rootOf(session, byId);
+		if (root.taskId && root.taskId !== "unclassified") continue;
+		const taskId = `task:${root.id}`;
+		root.taskId = taskId;
+		root.assignmentSource = "provisional";
+		if (!project.tasks.some((task) => task.id === taskId)) {
+			project.tasks.push({
+				id: taskId,
+				title: root.title ?? root.card.originalName ?? "Untitled task",
+				provisional: true,
+				locked: false,
+				createdAt: root.createdAt,
+				updatedAt: root.updatedAt,
+			});
+		}
+	}
+	for (const session of project.sessions) {
+		if (!session.parentId) continue;
+		const root = rootOf(session, byId);
+		if (session.taskId === "unclassified" || !session.taskId) {
+			session.taskId = root.taskId;
+			session.assignmentSource = root.assignmentSource;
+		}
+	}
+	const used = new Set(project.sessions.map((session) => session.taskId));
+	project.tasks = project.tasks.filter((task) => task.id !== "unclassified" || used.has(task.id));
+	return project;
 }
 
 function emptyIndex(): TaskManagerIndex {
@@ -53,7 +110,7 @@ async function writeIndex(index: TaskManagerIndex): Promise<void> {
 export async function readProject(cwd: string): Promise<ProjectIndex> {
 	const index = await readIndex();
 	const project = index.projects[projectKey(cwd)];
-	return project ? { ...project, autoHandoff: project.autoHandoff ?? false } : emptyProject(cwd);
+	return project ? normalizeProject(project) : emptyProject(cwd);
 }
 
 export function updateIndex(change: (index: TaskManagerIndex) => void | Promise<void>): Promise<void> {
@@ -70,8 +127,7 @@ export function updateIndex(change: (index: TaskManagerIndex) => void | Promise<
 export function updateProject(cwd: string, change: (project: ProjectIndex) => void | Promise<void>): Promise<void> {
 	return updateIndex(async (index) => {
 		const key = projectKey(cwd);
-		const project = index.projects[key] ?? emptyProject(cwd);
-		project.autoHandoff ??= false;
+		const project = normalizeProject(index.projects[key] ?? emptyProject(cwd));
 		await change(project);
 		index.projects[key] = project;
 	});
