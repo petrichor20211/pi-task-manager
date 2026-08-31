@@ -178,34 +178,9 @@ export default function taskManager(pi: ExtensionAPI) {
 		const initialProgress: OrganizeProgress = { phase: "scanning", completed: 0, total: 0, elapsedMs: 0 };
 		const jobController = new AbortController();
 		const record: OrganizeJob = { promise: Promise.resolve(), controller: jobController, startedAt, progress: initialProgress };
-		let lastRenderedAt = startedAt;
 		jobs.set(key, record);
-		if (ctx.hasUI) ctx.ui.setStatus(
-			"task-manager-organize",
-			ctx.ui.theme.fg("muted", progressText(initialProgress)),
-		);
-		const refreshTimer = ctx.hasUI ? setInterval(() => {
-			try {
-				ctx.ui.setStatus(
-					"task-manager-organize",
-					ctx.ui.theme.fg("muted", progressText(record.progress, Date.now() - startedAt)),
-				);
-			} catch {}
-		}, 1000) : undefined;
-		refreshTimer?.unref();
 		const job = organizeProject(ctx, force, jobController.signal, (progress) => {
-			const phaseChanged = progress.phase !== record.progress.phase;
 			record.progress = progress;
-			const now = Date.now();
-			if (!phaseChanged && progress.completed !== progress.total && now - lastRenderedAt < 100) return;
-			lastRenderedAt = now;
-			if (!ctx.hasUI) return;
-			try {
-				ctx.ui.setStatus(
-					"task-manager-organize",
-					ctx.ui.theme.fg("muted", progressText(progress)),
-				);
-			} catch {}
 		})
 			.then((result) => {
 				if (ctx.hasUI) ctx.ui.notify(
@@ -220,10 +195,6 @@ export default function taskManager(pi: ExtensionAPI) {
 			})
 			.finally(() => {
 				jobs.delete(key);
-				if (refreshTimer) clearInterval(refreshTimer);
-				try {
-					ctx.ui.setStatus("task-manager-organize", undefined);
-				} catch {}
 			});
 		record.promise = job;
 		return { started: true, promise: job };
@@ -232,9 +203,6 @@ export default function taskManager(pi: ExtensionAPI) {
 	registerHandoff(pi);
 
 	pi.on("session_start", async (event, ctx) => {
-		// Task titles are available in /tasks; keeping them permanently in the
-		// shared footer adds noise and can consume most of a narrow terminal.
-		ctx.ui.setStatus("task-manager", undefined);
 		// newSession.setup() has not run yet, so scanning here could race the
 		// handoff transaction and observe an incomplete continuation Session.
 		if (isHandoffReplacement(event.previousSessionFile)) return;

@@ -44,7 +44,7 @@ Every live root Session immediately receives `task:<rootSessionId>` as a stable 
 
 The checkpoint separates objective, completed facts, in-progress work, authorized next actions, questions waiting for the user, files, verification, constraints, processes, and active monitor snapshots. Invalid JSON/schema/evidence output is retried once. If the source leaf changes during generation, the engine waits for Pi to settle and regenerates against the new leaf under the same handoff operation.
 
-Handoff uses a durable journal with `PREPARING → PREPARED → SWITCHING → COMMITTED`. The target Session is seeded and verified on disk before the Task index and source handoff marker are committed. A failed switch reuses the same operation ID and checkpoint; startup recovery commits an already-persisted target and resumes a continuation prompt only when its operation marker is absent.
+Handoff uses a durable journal with `PREPARING → PREPARED → SWITCHING → COMMITTED`. While it runs, a compact animated panel above the editor shows the four stages: preparing the source, creating the checkpoint, opening the continuation Session, and starting the continuation. It disappears when the operation finishes, while success, cancellation, and errors remain visible as notifications. The target Session is seeded and verified on disk before the Task index and source handoff marker are committed. A failed switch reuses the same operation ID and checkpoint; startup recovery commits an already-persisted target and resumes a continuation prompt only when its operation marker is absent.
 
 A manual handoff always switches. Automatic handoff is off by default and stored per normalized project path. When enabled, it checks only after a settled run with no pending messages or active handoff, currently at 35% context usage. Executable unfinished work continues automatically; a user-blocked Task asks only its recorded question; an empty automatic checkpoint marks that leaf as checked and stays in the source Session.
 
@@ -56,7 +56,7 @@ Organization sends compact Session Cards to the active Pi model in batches of at
 
 Session file metadata and changed JSONL files are read with bounded concurrency (12 workers), so large first-time scans do not wait for 200 serial file reads or create unbounded I/O. AI batches remain sequential: each later batch can reuse Tasks created by earlier batches, which preserves grouping consistency and avoids provider rate-limit bursts.
 
-Automatic organization is off by default and stored per normalized project path. When enabled, Pi starts an incremental background pass at session startup. `/task-organize` also returns immediately while work continues in-process. During a pass, the footer reports `scanning → parsing → organizing AI batches → saving`, including counts and elapsed time; `/task-organize status` reports the same state on demand. Completion or failure is shown as a notification.
+Automatic organization is off by default and stored per normalized project path. When enabled, Pi starts an incremental background pass at session startup. `/task-organize` also returns immediately while work continues in-process. The extension does not add anything to Pi's footer; `/task-organize status` reports the current phase, count, and elapsed time on demand. Completion or failure is shown as a notification.
 
 The index is stored at:
 

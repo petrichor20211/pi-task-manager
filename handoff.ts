@@ -3,6 +3,7 @@ import {
 	type ExtensionCommandContext,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Loader } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
@@ -31,6 +32,8 @@ import type { SessionRecord, TaskRecord } from "./types.ts";
 export { isGeneratedHandoffMessage } from "./checkpoint.ts";
 
 const AUTO_HANDOFF_PERCENT = 35;
+const HANDOFF_PROGRESS_KEY = "task-manager-handoff";
+const HANDOFF_PROGRESS_STEPS = 4;
 
 type NewSessionOptions = NonNullable<Parameters<ExtensionCommandContext["newSession"]>[0]>;
 type ReplacementContext = Parameters<NonNullable<NewSessionOptions["withSession"]>>[0];
@@ -41,6 +44,29 @@ type OperationHolder = typeof globalThis & { [operationsKey]?: Set<string> };
 function activeOperations(): Set<string> {
 	const holder = globalThis as OperationHolder;
 	return holder[operationsKey] ??= new Set<string>();
+}
+
+function showHandoffProgress(ctx: ExtensionContext, step: number, message: string): void {
+	if (ctx.mode !== "tui") return;
+	try {
+		ctx.ui.setWidget(HANDOFF_PROGRESS_KEY, (tui, theme) => new Loader(
+			tui,
+			(text) => theme.fg("accent", text),
+			(text) => text,
+			`${theme.fg("accent", theme.bold("Handoff"))}  ${theme.fg("dim", `${step}/${HANDOFF_PROGRESS_STEPS}`)}  ${theme.fg("muted", message)}`,
+		));
+	} catch {
+		// Progress UI is best-effort and must never affect the transaction.
+	}
+}
+
+function clearHandoffProgress(ctx: ExtensionContext): void {
+	if (ctx.mode !== "tui") return;
+	try {
+		ctx.ui.setWidget(HANDOFF_PROGRESS_KEY, undefined);
+	} catch {
+		// The source UI is already stale after a successful Session replacement.
+	}
 }
 
 export function isHandoffReplacement(previousSessionFile?: string): boolean {
@@ -228,6 +254,7 @@ export function registerHandoff(pi: ExtensionAPI): void {
 				return;
 			}
 			activeOperations().add(canonicalSource);
+			showHandoffProgress(ctx, 1, "Preparing the source Session");
 
 			let journal: HandoffJournal | undefined;
 			try {
@@ -266,6 +293,11 @@ export function registerHandoff(pi: ExtensionAPI): void {
 					await writeHandoffJournal(journal);
 				}
 
+				showHandoffProgress(
+					ctx,
+					2,
+					journal.checkpoint ? "Using the prepared checkpoint" : "Creating a continuation checkpoint",
+				);
 				if (!journal.checkpoint) {
 					while (true) {
 						const branch = ctx.sessionManager.getBranch();
@@ -314,6 +346,7 @@ export function registerHandoff(pi: ExtensionAPI): void {
 							await writeHandoffJournal(journal);
 							break;
 						}
+						showHandoffProgress(ctx, 2, "Context changed · rebuilding the checkpoint");
 						await ctx.waitForIdle();
 						sourceLeafId = ctx.sessionManager.getLeafId() ?? undefined;
 						journal.source.leafId = sourceLeafId;
@@ -326,6 +359,7 @@ export function registerHandoff(pi: ExtensionAPI): void {
 				if (automatic && checkpoint.state.inProgress.length === 0
 					&& checkpoint.state.nextActions.length === 0 && checkpoint.state.awaitingUser.length === 0) {
 					await commitHandoff(journal);
+					clearHandoffProgress(ctx);
 					ctx.ui.notify("No unfinished work or pending user question was found; staying in this Session", "info");
 					return;
 				}
@@ -338,56 +372,69 @@ export function registerHandoff(pi: ExtensionAPI): void {
 				const bootstrapModel = { api: selectedModel.api, provider: selectedModel.provider, id: selectedModel.id };
 				let setupError: unknown;
 				const finishReplacement = async (replacementCtx: ReplacementContext): Promise<void> => {
-					if (setupError) {
-						journal!.state = "FAILED";
-						journal!.error = setupError instanceof Error ? setupError.message : String(setupError);
-						await writeHandoffJournal(journal!).catch(() => undefined);
-						const message = `Handoff target setup failed: ${journal!.error}`;
-						await replacementCtx.switchSession(canonicalSource, {
-							withSession: async (sourceCtx) => sourceCtx.ui.notify(message, "error"),
-						});
-						return;
-					}
-					let continuationError: unknown;
-					if (continueText) {
-						try {
-							await replacementCtx.sendUserMessage(continueText);
-						} catch (error) {
-							continuationError = error;
-							if (journal!.target && !(await targetHasContinuationPrompt(journal!.target.sessionPath, journal!.handoffId))) {
-								try {
-									await replacementCtx.sendUserMessage(continueText);
-									continuationError = undefined;
-								} catch (retryError) {
-									continuationError = retryError;
+					showHandoffProgress(
+						replacementCtx,
+						4,
+						continueText ? "Starting work in the continuation" : "Finalizing the continuation",
+					);
+					try {
+						if (setupError) {
+							journal!.state = "FAILED";
+							journal!.error = setupError instanceof Error ? setupError.message : String(setupError);
+							await writeHandoffJournal(journal!).catch(() => undefined);
+							const message = `Handoff target setup failed: ${journal!.error}`;
+							await replacementCtx.switchSession(canonicalSource, {
+								withSession: async (sourceCtx) => {
+									clearHandoffProgress(sourceCtx);
+									sourceCtx.ui.notify(message, "error");
+								},
+							});
+							return;
+						}
+						let continuationError: unknown;
+						if (continueText) {
+							try {
+								await replacementCtx.sendUserMessage(continueText);
+							} catch (error) {
+								continuationError = error;
+								if (journal!.target && !(await targetHasContinuationPrompt(journal!.target.sessionPath, journal!.handoffId))) {
+									try {
+										await replacementCtx.sendUserMessage(continueText);
+										continuationError = undefined;
+									} catch (retryError) {
+										continuationError = retryError;
+									}
 								}
 							}
 						}
+						try {
+							await verifyTargetSession(journal!.target!.sessionPath, journal!.target!.sessionId, journal!.handoffId);
+							await commitHandoff(journal!);
+						} catch (error) {
+							journal!.state = "SWITCHING";
+							journal!.error = error instanceof Error ? error.message : String(error);
+							await writeHandoffJournal(journal!).catch(() => undefined);
+							replacementCtx.ui.notify(`Handoff recovery is pending: ${journal!.error}`, "error");
+							return;
+						}
+						if (checkpoint.state.monitors.length > 0) replacementCtx.ui.notify(
+							`${checkpoint.state.monitors.length} active monitor(s) were recorded; verify that the task-monitor extension transferred them to this Session`,
+							"warning",
+						);
+						if (continuationError) replacementCtx.ui.notify(
+							`Handoff committed, but automatic continuation failed: ${continuationError instanceof Error ? continuationError.message : String(continuationError)}`,
+							"error",
+						);
+						else replacementCtx.ui.notify(
+							continueText ? "Handoff committed and continuation started." : "Handoff committed; the new Session is ready.",
+							"info",
+						);
+					} finally {
+						clearHandoffProgress(replacementCtx);
 					}
-					try {
-						await verifyTargetSession(journal!.target!.sessionPath, journal!.target!.sessionId, journal!.handoffId);
-						await commitHandoff(journal!);
-					} catch (error) {
-						journal!.state = "SWITCHING";
-						journal!.error = error instanceof Error ? error.message : String(error);
-						await writeHandoffJournal(journal!).catch(() => undefined);
-						replacementCtx.ui.notify(`Handoff recovery is pending: ${journal!.error}`, "error");
-						return;
-					}
-					if (checkpoint.state.monitors.length > 0) replacementCtx.ui.notify(
-						`${checkpoint.state.monitors.length} active monitor(s) were recorded; verify that the task-monitor extension transferred them to this Session`,
-						"warning",
-					);
-					if (continuationError) replacementCtx.ui.notify(
-						`Handoff committed, but automatic continuation failed: ${continuationError instanceof Error ? continuationError.message : String(continuationError)}`,
-						"error",
-					);
-					else replacementCtx.ui.notify(
-						continueText ? "Handoff committed and continuation started." : "Handoff committed; the new Session is ready.",
-						"info",
-					);
 				};
 
+				showHandoffProgress(ctx, 3, "Opening the continuation Session");
 				let cancelled: boolean;
 				if (journal.target && await targetExists(journal)) {
 					await verifyTargetSession(journal.target.sessionPath, journal.target.sessionId, journal.handoffId);
@@ -431,7 +478,6 @@ export function registerHandoff(pi: ExtensionAPI): void {
 								journal!.state = "SWITCHING";
 								journal!.attempts += 1;
 								await writeHandoffJournal(journal!);
-								sessionManager.appendSessionInfo(title);
 								sessionManager.appendCustomMessageEntry(CUSTOM_TYPE, checkpointMarkdown(checkpoint), true, checkpoint);
 								sessionManager.appendMessage({
 									role: "assistant",
@@ -459,9 +505,11 @@ export function registerHandoff(pi: ExtensionAPI): void {
 					journal.state = "FAILED";
 					journal.error = "Session switch was cancelled";
 					await writeHandoffJournal(journal);
+					clearHandoffProgress(ctx);
 					ctx.ui.notify("Handoff cancelled", "info");
 				}
 			} catch (error) {
+				clearHandoffProgress(ctx);
 				const message = error instanceof Error ? error.message : String(error);
 				if (journal) {
 					journal.state = journal.target && await targetExists(journal) ? "SWITCHING" : "FAILED";
